@@ -26,6 +26,7 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 
 bun build src/index.ts --compile --target "$TARGET" --outfile "${OUT_DIR}/${BIN_NAME}${EXT}"
+chmod +x "${OUT_DIR}/${BIN_NAME}${EXT}"
 
 if [[ "$TARGET" == *"windows"* ]]; then
   (cd "$OUT_DIR" && zip -q "../${ARCHIVE_NAME}.zip" "${BIN_NAME}${EXT}")

@@ -58,6 +58,7 @@ jobs:
         run: |
           mkdir -p dist/release/${{ matrix.bun_target }}
           bun build src/index.ts --compile --target "${{ matrix.bun_target }}" --outfile "dist/release/${{ matrix.bun_target }}/${{ matrix.binary }}"
+          chmod +x "dist/release/${{ matrix.bun_target }}/${{ matrix.binary }}"
 
       - name: Package archive (tar.gz)
         if: matrix.package == 'tar'
@@ -69,6 +70,15 @@ jobs:
         shell: bash
         run: |
           7z a -tzip "dist/release/${{ matrix.archive }}" "dist/release/${{ matrix.bun_target }}/${{ matrix.binary }}"
+
+      - name: Verify archive contents
+        shell: bash
+        run: |
+          if [[ "${{ matrix.package }}" == "tar" ]]; then
+            tar -tzf "dist/release/${{ matrix.archive }}" | grep -qx "${{ matrix.binary }}"
+          else
+            7z l "dist/release/${{ matrix.archive }}" | grep -q "${{ matrix.binary }}"
+          fi
 
       - name: Generate sha256
         shell: bash

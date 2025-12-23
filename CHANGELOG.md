@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2025-12-24
+
+- Ensure release artifacts contain an executable autohand-acp binary at the archive root.
+- Add archive content verification to the release workflow.
+
 ## [0.1.0] - 2025-12-24
 
 - Initial ACP adapter for Autohand CLI with Zed agent server support.
