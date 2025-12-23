@@ -18,7 +18,7 @@ jobs:
             archive: autohand-acp-darwin-arm64.tar.gz
             binary: autohand-acp
             package: tar
-          - os: macos-13
+          - os: macos-15-intel
             bun_target: bun-darwin-x64
             archive: autohand-acp-darwin-x64.tar.gz
             binary: autohand-acp
