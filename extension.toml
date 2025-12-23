@@ -1,0 +1,29 @@
+id = "autohand-acp"
+name = "Autohand ACP"
+version = "0.1.0"
+schema_version = 1
+authors = ["Autohand AI <team@autohand.ai>"]
+description = "Agent Server extension that runs the Autohand CLI over ACP."
+repository = "https://github.com/autohandai/autohand-acp"
+
+[agent_servers.autohand]
+name = "Autohand"
+
+[agent_servers.autohand.env]
+AUTOHAND_PERMISSION_MODE = "auto"
+
+[agent_servers.autohand.targets.darwin-aarch64]
+archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.0/autohand-acp-darwin-arm64.tar.gz"
+cmd = "./autohand-acp"
+
+[agent_servers.autohand.targets.darwin-x86_64]
+archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.0/autohand-acp-darwin-x64.tar.gz"
+cmd = "./autohand-acp"
+
+[agent_servers.autohand.targets.linux-x86_64]
+archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.0/autohand-acp-linux-x64.tar.gz"
+cmd = "./autohand-acp"
+
+[agent_servers.autohand.targets.windows-x86_64]
+archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.0/autohand-acp-windows-x64.zip"
+cmd = "./autohand-acp.exe"

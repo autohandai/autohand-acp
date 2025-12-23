@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-artifacts:
+    name: Build ${{ matrix.archive }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            bun_target: bun-darwin-arm64
+            archive: autohand-acp-darwin-arm64.tar.gz
+            binary: autohand-acp
+            package: tar
+          - os: macos-13
+            bun_target: bun-darwin-x64
+            archive: autohand-acp-darwin-x64.tar.gz
+            binary: autohand-acp
+            package: tar
+          - os: ubuntu-latest
+            bun_target: bun-linux-x64
+            archive: autohand-acp-linux-x64.tar.gz
+            binary: autohand-acp
+            package: tar
+          - os: windows-latest
+            bun_target: bun-windows-x64
+            archive: autohand-acp-windows-x64.zip
+            binary: autohand-acp.exe
+            package: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v1
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Build binary
+        run: |
+          mkdir -p dist/release/${{ matrix.bun_target }}
+          bun build src/index.ts --compile --target "${{ matrix.bun_target }}" --outfile "dist/release/${{ matrix.bun_target }}/${{ matrix.binary }}"
+
+      - name: Package archive (tar.gz)
+        if: matrix.package == 'tar'
+        run: |
+          tar -C dist/release/${{ matrix.bun_target }} -czf dist/release/${{ matrix.archive }} ${{ matrix.binary }}
+
+      - name: Package archive (zip)
+        if: matrix.package == 'zip'
+        shell: bash
+        run: |
+          7z a -tzip "dist/release/${{ matrix.archive }}" "dist/release/${{ matrix.bun_target }}/${{ matrix.binary }}"
+
+      - name: Generate sha256
+        shell: bash
+        run: |
+          node -e "const fs=require('fs');const crypto=require('crypto');const file=process.argv[1];const data=fs.readFileSync(file);const hash=crypto.createHash('sha256').update(data).digest('hex');fs.writeFileSync(file + '.sha256', hash);console.log(hash);" dist/release/${{ matrix.archive }}
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.archive }}
+          path: |
+            dist/release/${{ matrix.archive }}
+            dist/release/${{ matrix.archive }}.sha256
+
+      - name: Upload release assets
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            dist/release/${{ matrix.archive }}
+            dist/release/${{ matrix.archive }}.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-npm:
+    name: Publish npm
+    runs-on: ubuntu-latest
+    needs: build-artifacts
+    if: github.event_name == 'release'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build TypeScript
+        run: npm run build
+
+      - name: Publish
+        if: env.NPM_TOKEN != ''
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
