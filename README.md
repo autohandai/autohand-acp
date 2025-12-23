@@ -44,6 +44,16 @@ Environment variables control how the adapter launches Autohand:
 - `AUTOHAND_INCLUDE_HISTORY`: Set to `1` to include prior turns in the prompt
 - `AUTOHAND_HISTORY_LIMIT`: Max turns to include (default: 6)
 - `AUTOHAND_MAX_HISTORY_CHARS`: Max history chars to include (default: 8000)
+- `AUTOHAND_AVAILABLE_COMMANDS_JSON`: JSON array of ACP commands to expose in Zed
+- `AUTOHAND_AVAILABLE_MODES`: Comma-separated session modes (default: `default,ask,code`)
+- `AUTOHAND_AVAILABLE_MODES_JSON`: JSON array of session modes
+- `AUTOHAND_DEFAULT_MODE`: Default session mode id
+- `AUTOHAND_AVAILABLE_MODELS`: Comma-separated model IDs for Zed model picker
+- `AUTOHAND_AVAILABLE_MODELS_JSON`: JSON array of model info
+- `AUTOHAND_USE_CLIENT_TERMINAL`: Set to `1` to run Autohand in a Zed-managed terminal
+- `AUTOHAND_EMBED_RESOURCE_LINKS`: Set to `1` to resolve `resource_link` blocks via ACP `read_text_file`
+- `AUTOHAND_SUPPORTS_IMAGE`: Set to `1` if Autohand can handle image prompts
+- `AUTOHAND_SUPPORTS_AUDIO`: Set to `1` if Autohand can handle audio prompts
 
 ## Limitations
 
