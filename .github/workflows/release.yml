@@ -338,10 +338,9 @@ jobs:
         run: npm run build
 
       - name: Publish
-        if: env.NPM_TOKEN != ''
         run: npm publish
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_KEY }}
 
   update-extension-toml:
     name: Update extension.toml with SHA256
