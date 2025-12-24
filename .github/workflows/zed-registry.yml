@@ -119,6 +119,9 @@ jobs:
 
           echo "ZED_REGISTRY_PAT found, creating PR automatically..."
 
+          # Configure git to use the PAT for authentication
+          git config --global url."https://${GH_TOKEN}@github.com/".insteadOf "https://github.com/"
+
           # Fork the repo (if not already forked)
           gh repo fork zed-industries/extensions --clone=false || true
 
@@ -126,12 +129,13 @@ jobs:
           FORK_OWNER=$(gh api user --jq '.login')
           echo "Fork owner: $FORK_OWNER"
 
-          # Clone the fork
-          gh repo clone "$FORK_OWNER/extensions" zed-extensions || git clone "https://github.com/$FORK_OWNER/extensions.git" zed-extensions
+          # Clone the fork using gh (which handles auth)
+          gh repo clone "$FORK_OWNER/extensions" zed-extensions -- --depth=1
           cd zed-extensions
 
-          # Sync with upstream
-          git remote add upstream https://github.com/zed-industries/extensions.git || true
+          # Set up remotes with auth
+          git remote set-url origin "https://${GH_TOKEN}@github.com/$FORK_OWNER/extensions.git"
+          git remote add upstream https://github.com/zed-industries/extensions.git 2>/dev/null || true
           git fetch upstream
           git checkout main
           git reset --hard upstream/main
