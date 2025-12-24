@@ -40,29 +40,31 @@ jobs:
           echo "Version: $VERSION"
 
       - name: Verify release exists
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          REPO="${{ github.repository }}"
 
           echo "Checking release artifacts for v$VERSION..."
 
-          for platform in darwin-arm64 darwin-x64 linux-x64; do
-            URL="https://github.com/$REPO/releases/download/v$VERSION/autohand-acp-$platform.tar.gz"
-            if curl --output /dev/null --silent --head --fail "$URL"; then
-              echo "✓ $platform archive available"
+          # Use gh CLI which has authentication for private repos
+          ASSETS=$(gh release view "v$VERSION" --json assets --jq '.assets[].name' 2>/dev/null || echo "")
+
+          if [ -z "$ASSETS" ]; then
+            echo "✗ Release v$VERSION not found"
+            exit 1
+          fi
+
+          REQUIRED_ASSETS="autohand-acp-darwin-arm64.tar.gz autohand-acp-darwin-x64.tar.gz autohand-acp-linux-x64.tar.gz autohand-acp-windows-x64.zip"
+
+          for asset in $REQUIRED_ASSETS; do
+            if echo "$ASSETS" | grep -q "^$asset$"; then
+              echo "✓ $asset available"
             else
-              echo "✗ Missing: $URL"
+              echo "✗ Missing: $asset"
               exit 1
             fi
           done
-
-          URL="https://github.com/$REPO/releases/download/v$VERSION/autohand-acp-windows-x64.zip"
-          if curl --output /dev/null --silent --head --fail "$URL"; then
-            echo "✓ windows-x64 archive available"
-          else
-            echo "✗ Missing: $URL"
-            exit 1
-          fi
 
           echo ""
           echo "All release artifacts verified!"
