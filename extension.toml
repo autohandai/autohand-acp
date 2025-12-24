@@ -1,6 +1,6 @@
 id = "autohand-acp"
 name = "Autohand CLI"
-version = "0.1.1"
+version = "0.1.2"
 schema_version = 1
 authors = ["Autohand AI <team@autohand.ai>"]
 description = "AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP). Features include file editing, code search, terminal commands, and intelligent code assistance."
@@ -14,17 +14,17 @@ icon = "icons/autohand.svg"
 AUTOHAND_PERMISSION_MODE = "external"
 
 [agent_servers.autohand.targets.darwin-aarch64]
-archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.1/autohand-acp-darwin-arm64.tar.gz"
+archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.2/autohand-acp-darwin-arm64.tar.gz"
 cmd = "./autohand-acp"
 
 [agent_servers.autohand.targets.darwin-x86_64]
-archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.1/autohand-acp-darwin-x64.tar.gz"
+archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.2/autohand-acp-darwin-x64.tar.gz"
 cmd = "./autohand-acp"
 
 [agent_servers.autohand.targets.linux-x86_64]
-archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.1/autohand-acp-linux-x64.tar.gz"
+archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.2/autohand-acp-linux-x64.tar.gz"
 cmd = "./autohand-acp"
 
 [agent_servers.autohand.targets.windows-x86_64]
-archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.1/autohand-acp-windows-x64.zip"
+archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.2/autohand-acp-windows-x64.zip"
 cmd = "./autohand-acp.exe"
