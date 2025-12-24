@@ -1,13 +1,14 @@
 name: Submit to Zed Registry
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version to submit (e.g., 0.1.1)'
-        required: true
+        description: 'Version to submit (e.g., 0.1.3) - leave empty to use latest'
+        required: false
+
+permissions:
+  contents: read
 
 jobs:
   submit-to-zed:
@@ -16,88 +17,171 @@ jobs:
     steps:
       - name: Checkout autohand-acp
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Get version
         id: version
         run: |
-          if [ "${{ github.event_name }}" = "release" ]; then
-            VERSION="${{ github.event.release.tag_name }}"
-            VERSION="${VERSION#v}"
-          else
+          if [ -n "${{ inputs.version }}" ]; then
             VERSION="${{ inputs.version }}"
+          else
+            # Get latest tag
+            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+            VERSION="${VERSION#v}"
           fi
+
+          if [ -z "$VERSION" ]; then
+            echo "Error: No version specified and no tags found"
+            exit 1
+          fi
+
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
-      - name: Clone zed-industries/extensions
+      - name: Verify release exists
         run: |
-          git clone https://github.com/zed-industries/extensions.git zed-extensions
-          cd zed-extensions
+          VERSION="${{ steps.version.outputs.version }}"
+          REPO="${{ github.repository }}"
 
-      - name: Check if extension exists
-        id: check
-        run: |
-          cd zed-extensions
-          if [ -d "extensions/autohand-acp" ]; then
-            echo "exists=true" >> $GITHUB_OUTPUT
-            echo "Extension already in registry, will update version"
+          echo "Checking release artifacts for v$VERSION..."
+
+          for platform in darwin-arm64 darwin-x64 linux-x64; do
+            URL="https://github.com/$REPO/releases/download/v$VERSION/autohand-acp-$platform.tar.gz"
+            if curl --output /dev/null --silent --head --fail "$URL"; then
+              echo "✓ $platform archive available"
+            else
+              echo "✗ Missing: $URL"
+              exit 1
+            fi
+          done
+
+          URL="https://github.com/$REPO/releases/download/v$VERSION/autohand-acp-windows-x64.zip"
+          if curl --output /dev/null --silent --head --fail "$URL"; then
+            echo "✓ windows-x64 archive available"
           else
-            echo "exists=false" >> $GITHUB_OUTPUT
-            echo "New extension, will add submodule"
+            echo "✗ Missing: $URL"
+            exit 1
           fi
+
+          echo ""
+          echo "All release artifacts verified!"
 
       - name: Setup Git
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-      - name: Add/Update extension
+      - name: Create PR to Zed Registry
+        env:
+          GH_TOKEN: ${{ secrets.ZED_REGISTRY_PAT }}
         run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          REPO="${{ github.repository }}"
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "================================================"
+            echo "MANUAL STEP REQUIRED"
+            echo "================================================"
+            echo ""
+            echo "No ZED_REGISTRY_PAT secret found."
+            echo "To automate this, add a GitHub PAT with 'repo' scope as ZED_REGISTRY_PAT secret."
+            echo ""
+            echo "Manual submission steps:"
+            echo ""
+            echo "1. Fork https://github.com/zed-industries/extensions"
+            echo ""
+            echo "2. Clone your fork:"
+            echo "   git clone https://github.com/YOUR_USERNAME/extensions.git"
+            echo "   cd extensions"
+            echo ""
+            echo "3. Add the extension as a submodule:"
+            echo "   git submodule add https://github.com/$REPO.git extensions/autohand-acp"
+            echo ""
+            echo "4. Add to extensions.toml:"
+            echo "   [autohand-acp]"
+            echo "   submodule = \"extensions/autohand-acp\""
+            echo "   version = \"$VERSION\""
+            echo ""
+            echo "5. Sort and commit:"
+            echo "   pnpm sort-extensions"
+            echo "   git add ."
+            echo "   git commit -m \"Add autohand-acp extension v$VERSION\""
+            echo "   git push origin main"
+            echo ""
+            echo "6. Create PR: https://github.com/zed-industries/extensions/compare"
+            echo ""
+            echo "================================================"
+            exit 0
+          fi
+
+          echo "ZED_REGISTRY_PAT found, creating PR automatically..."
+
+          # Fork the repo (if not already forked)
+          gh repo fork zed-industries/extensions --clone=false || true
+
+          # Get the fork name
+          FORK_OWNER=$(gh api user --jq '.login')
+          echo "Fork owner: $FORK_OWNER"
+
+          # Clone the fork
+          gh repo clone "$FORK_OWNER/extensions" zed-extensions || git clone "https://github.com/$FORK_OWNER/extensions.git" zed-extensions
           cd zed-extensions
 
-          if [ "${{ steps.check.outputs.exists }}" = "false" ]; then
-            # Add as new submodule
-            git submodule add https://github.com/${{ github.repository }}.git extensions/autohand-acp
+          # Sync with upstream
+          git remote add upstream https://github.com/zed-industries/extensions.git || true
+          git fetch upstream
+          git checkout main
+          git reset --hard upstream/main
+
+          # Create a branch for the PR
+          BRANCH="add-autohand-acp-v$VERSION"
+          git checkout -b "$BRANCH"
+
+          # Check if extension already exists
+          if [ -d "extensions/autohand-acp" ]; then
+            echo "Extension already exists, updating..."
+            cd extensions/autohand-acp
+            git fetch origin
+            git checkout "v$VERSION" || git checkout main
+            cd ../..
+          else
+            echo "Adding new extension..."
+            git submodule add "https://github.com/$REPO.git" extensions/autohand-acp
+            cd extensions/autohand-acp
+            git checkout "v$VERSION" || git checkout main
+            cd ../..
           fi
 
           # Update extensions.toml
-          if ! grep -q "autohand-acp" extensions.toml; then
-            echo "" >> extensions.toml
-            echo "[autohand-acp]" >> extensions.toml
-            echo 'submodule = "extensions/autohand-acp"' >> extensions.toml
-            echo 'version = "${{ steps.version.outputs.version }}"' >> extensions.toml
+          if grep -q "\[autohand-acp\]" extensions.toml; then
+            # Update existing entry
+            sed -i "/\[autohand-acp\]/,/^$/s/version = .*/version = \"$VERSION\"/" extensions.toml
           else
-            # Update version
-            sed -i 's/\(\[autohand-acp\]\n.*\nversion = \)"[^"]*"/\1"${{ steps.version.outputs.version }}"/' extensions.toml || true
+            # Add new entry (will be sorted later)
+            cat >> extensions.toml << EOF
+
+          [autohand-acp]
+          submodule = "extensions/autohand-acp"
+          version = "$VERSION"
+          EOF
           fi
 
-      - name: Create PR info
-        run: |
-          cat << 'EOF'
-          ================================================
-          MANUAL STEP REQUIRED
-          ================================================
+          # Sort extensions (if pnpm available)
+          if command -v pnpm &> /dev/null; then
+            pnpm install
+            pnpm sort-extensions
+          fi
 
-          To complete the submission to the Zed Extension Registry:
+          # Commit changes
+          git add .
+          git commit -m "Add autohand-acp extension v$VERSION"
 
-          1. Fork https://github.com/zed-industries/extensions
+          # Push to fork
+          git push -u origin "$BRANCH" --force
 
-          2. Add the extension as a submodule:
-             cd extensions
-             git submodule add https://github.com/${{ github.repository }}.git extensions/autohand-acp
-
-          3. Add to extensions.toml:
-             [autohand-acp]
-             submodule = "extensions/autohand-acp"
-             version = "${{ steps.version.outputs.version }}"
-
-          4. Run: pnpm sort-extensions
-
-          5. Commit and create a PR to zed-industries/extensions
-
-          PR Title: Add autohand-acp extension v${{ steps.version.outputs.version }}
-
-          PR Description:
+          # Create PR
+          PR_BODY=$(cat << 'PREOF'
           ## Extension: Autohand CLI
 
           AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP).
@@ -110,19 +194,22 @@ jobs:
           - Permission controls (external/auto/restricted)
           - Dynamic session titles
           - Image/screenshot support
+          - MCP server integration
 
           ### Links
           - Repository: https://github.com/${{ github.repository }}
-          - Releases: https://github.com/${{ github.repository }}/releases
+          - Release: https://github.com/${{ github.repository }}/releases/tag/v${{ steps.version.outputs.version }}
+          PREOF
+          )
 
-          ================================================
-          EOF
+          gh pr create \
+            --repo zed-industries/extensions \
+            --title "Add autohand-acp extension v$VERSION" \
+            --body "$PR_BODY" \
+            --head "$FORK_OWNER:$BRANCH" \
+            --base main
 
-      - name: Upload PR template
-        uses: actions/upload-artifact@v4
-        with:
-          name: zed-registry-pr-template
-          path: |
-            README.md
-            extension.toml
-            LICENSE
+          echo ""
+          echo "================================================"
+          echo "PR created successfully!"
+          echo "================================================"
