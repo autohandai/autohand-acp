@@ -23,7 +23,6 @@ permissions:
   contents: write
 
 jobs:
-  # Job to create release when triggered manually
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
@@ -53,21 +52,17 @@ jobs:
         id: version
         run: |
           CURRENT="${{ steps.current.outputs.version }}"
+          CUSTOM="${{ inputs.custom_version }}"
+          TYPE="${{ inputs.version_type }}"
 
-          if [ -n "${{ inputs.custom_version }}" ]; then
-            NEW_VERSION="${{ inputs.custom_version }}"
+          if [ -n "$CUSTOM" ]; then
+            NEW_VERSION="$CUSTOM"
           else
             IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-            case "${{ inputs.version_type }}" in
-              major)
-                NEW_VERSION="$((MAJOR + 1)).0.0"
-                ;;
-              minor)
-                NEW_VERSION="${MAJOR}.$((MINOR + 1)).0"
-                ;;
-              patch)
-                NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))"
-                ;;
+            case "$TYPE" in
+              major) NEW_VERSION="$((MAJOR + 1)).0.0" ;;
+              minor) NEW_VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
+              patch) NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
             esac
           fi
 
@@ -77,26 +72,21 @@ jobs:
 
       - name: Update package.json
         run: |
-          node -e "
-          const fs = require('fs');
-          const pkg = require('./package.json');
-          pkg.version = '${{ steps.version.outputs.version }}';
-          fs.writeFileSync('./package.json', JSON.stringify(pkg, null, 2) + '\n');
-          "
+          VERSION="${{ steps.version.outputs.version }}"
+          node -e "const fs=require('fs'); const p=require('./package.json'); p.version='$VERSION'; fs.writeFileSync('./package.json', JSON.stringify(p,null,2)+'\n');"
 
       - name: Update extension.toml
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           REPO="${{ github.repository }}"
-
-          cat > extension.toml << EOF
+          cat > extension.toml << 'TOMLEOF'
           id = "autohand-acp"
           name = "Autohand CLI"
-          version = "${VERSION}"
+          version = "VERSION_PLACEHOLDER"
           schema_version = 1
           authors = ["Autohand AI <team@autohand.ai>"]
           description = "AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP). Features include file editing, code search, terminal commands, and intelligent code assistance."
-          repository = "https://github.com/${REPO}"
+          repository = "https://github.com/REPO_PLACEHOLDER"
 
           [agent_servers.autohand]
           name = "Autohand CLI"
@@ -106,21 +96,25 @@ jobs:
           AUTOHAND_PERMISSION_MODE = "external"
 
           [agent_servers.autohand.targets.darwin-aarch64]
-          archive = "https://github.com/${REPO}/releases/download/v${VERSION}/autohand-acp-darwin-arm64.tar.gz"
+          archive = "https://github.com/REPO_PLACEHOLDER/releases/download/vVERSION_PLACEHOLDER/autohand-acp-darwin-arm64.tar.gz"
           cmd = "./autohand-acp"
 
           [agent_servers.autohand.targets.darwin-x86_64]
-          archive = "https://github.com/${REPO}/releases/download/v${VERSION}/autohand-acp-darwin-x64.tar.gz"
+          archive = "https://github.com/REPO_PLACEHOLDER/releases/download/vVERSION_PLACEHOLDER/autohand-acp-darwin-x64.tar.gz"
           cmd = "./autohand-acp"
 
           [agent_servers.autohand.targets.linux-x86_64]
-          archive = "https://github.com/${REPO}/releases/download/v${VERSION}/autohand-acp-linux-x64.tar.gz"
+          archive = "https://github.com/REPO_PLACEHOLDER/releases/download/vVERSION_PLACEHOLDER/autohand-acp-linux-x64.tar.gz"
           cmd = "./autohand-acp"
 
           [agent_servers.autohand.targets.windows-x86_64]
-          archive = "https://github.com/${REPO}/releases/download/v${VERSION}/autohand-acp-windows-x64.zip"
+          archive = "https://github.com/REPO_PLACEHOLDER/releases/download/vVERSION_PLACEHOLDER/autohand-acp-windows-x64.zip"
           cmd = "./autohand-acp.exe"
-          EOF
+          TOMLEOF
+          sed -i "s/VERSION_PLACEHOLDER/$VERSION/g" extension.toml
+          sed -i "s|REPO_PLACEHOLDER|$REPO|g" extension.toml
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' extension.toml
 
       - name: Commit version bump
         run: |
@@ -132,63 +126,70 @@ jobs:
 
       - name: Create tag
         run: |
-          git tag -a "${{ steps.version.outputs.tag }}" -m "Release ${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
+          TAG="${{ steps.version.outputs.tag }}"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
 
       - name: Generate release notes
         id: notes
         run: |
-          # Get the previous tag
+          TAG="${{ steps.version.outputs.tag }}"
+          REPO="${{ github.repository }}"
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
 
-          if [ -n "$PREV_TAG" ]; then
-            echo "Generating notes from $PREV_TAG to HEAD"
-            COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s" --no-merges | grep -v "release:" || true)
-          else
-            echo "No previous tag, using all commits"
-            COMMITS=$(git log --pretty=format:"- %s" --no-merges -20 | grep -v "release:" || true)
-          fi
+          {
+            echo "## What's Changed"
+            echo ""
 
-          # Categorize commits
-          FEATURES=$(echo "$COMMITS" | grep -i "^- feat" || true)
-          FIXES=$(echo "$COMMITS" | grep -i "^- fix" || true)
-          CHORES=$(echo "$COMMITS" | grep -i "^- chore\|^- ci\|^- docs\|^- style\|^- refactor\|^- test" || true)
-          OTHER=$(echo "$COMMITS" | grep -v -i "^- feat\|^- fix\|^- chore\|^- ci\|^- docs\|^- style\|^- refactor\|^- test" || true)
+            if [ -n "$PREV_TAG" ]; then
+              COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"%s" --no-merges | grep -v "^release:" || true)
+            else
+              COMMITS=$(git log --pretty=format:"%s" --no-merges -20 | grep -v "^release:" || true)
+            fi
 
-          # Build release notes
-          NOTES="## What's Changed"$'\n\n'
+            FEATURES=$(echo "$COMMITS" | grep -i "^feat" | sed 's/^/- /' || true)
+            FIXES=$(echo "$COMMITS" | grep -i "^fix" | sed 's/^/- /' || true)
+            OTHER=$(echo "$COMMITS" | grep -v -i "^feat\|^fix\|^release" | sed 's/^/- /' || true)
 
-          if [ -n "$FEATURES" ]; then
-            NOTES+="### Features"$'\n'"$FEATURES"$'\n\n'
-          fi
+            if [ -n "$FEATURES" ]; then
+              echo "### Features"
+              echo "$FEATURES"
+              echo ""
+            fi
 
-          if [ -n "$FIXES" ]; then
-            NOTES+="### Bug Fixes"$'\n'"$FIXES"$'\n\n'
-          fi
+            if [ -n "$FIXES" ]; then
+              echo "### Bug Fixes"
+              echo "$FIXES"
+              echo ""
+            fi
 
-          if [ -n "$CHORES" ]; then
-            NOTES+="### Maintenance"$'\n'"$CHORES"$'\n\n'
-          fi
+            if [ -n "$OTHER" ]; then
+              echo "### Other Changes"
+              echo "$OTHER"
+              echo ""
+            fi
 
-          if [ -n "$OTHER" ]; then
-            NOTES+="### Other"$'\n'"$OTHER"$'\n\n'
-          fi
+            echo "## Installation"
+            echo ""
+            echo "### Zed Extension"
+            echo "Once published to the Zed Extension Registry, install via Extensions panel."
+            echo ""
+            echo "### npm"
+            echo "\`\`\`bash"
+            echo "npm install -g @autohandai/autohand-acp"
+            echo "\`\`\`"
+            echo ""
+            echo "### npx (no install)"
+            echo "\`\`\`bash"
+            echo "npx @autohandai/autohand-acp"
+            echo "\`\`\`"
+            echo ""
 
-          NOTES+="## Installation"$'\n\n'
-          NOTES+="### Zed Extension"$'\n'
-          NOTES+="Once published to the Zed Extension Registry, install via Extensions panel."$'\n\n'
-          NOTES+="### Manual Installation"$'\n'
-          NOTES+="\`\`\`bash"$'\n'
-          NOTES+="npm install -g @autohandai/autohand-acp"$'\n'
-          NOTES+="\`\`\`"$'\n\n'
-          NOTES+="### npx (no install)"$'\n'
-          NOTES+="\`\`\`bash"$'\n'
-          NOTES+="npx @autohandai/autohand-acp"$'\n'
-          NOTES+="\`\`\`"$'\n\n'
-          NOTES+="**Full Changelog**: https://github.com/${{ github.repository }}/compare/${PREV_TAG}...${{ steps.version.outputs.tag }}"
+            if [ -n "$PREV_TAG" ]; then
+              echo "**Full Changelog**: https://github.com/$REPO/compare/${PREV_TAG}...${TAG}"
+            fi
+          } > release_notes.md
 
-          # Save to file for multiline handling
-          echo "$NOTES" > release_notes.md
           cat release_notes.md
 
       - name: Create GitHub Release
@@ -373,51 +374,52 @@ jobs:
       - name: Update extension.toml with SHA256 hashes
         run: |
           VERSION="${{ steps.version.outputs.version }}"
+          REPO="${{ github.repository }}"
 
-          # Read SHA256 hashes
           DARWIN_ARM64_SHA=$(cat artifacts/autohand-acp-darwin-arm64.tar.gz/autohand-acp-darwin-arm64.tar.gz.sha256)
           DARWIN_X64_SHA=$(cat artifacts/autohand-acp-darwin-x64.tar.gz/autohand-acp-darwin-x64.tar.gz.sha256)
           LINUX_X64_SHA=$(cat artifacts/autohand-acp-linux-x64.tar.gz/autohand-acp-linux-x64.tar.gz.sha256)
           WINDOWS_X64_SHA=$(cat artifacts/autohand-acp-windows-x64.zip/autohand-acp-windows-x64.zip.sha256)
 
-          # Update extension.toml
-          cat > extension.toml << EOF
-id = "autohand-acp"
-name = "Autohand CLI"
-version = "${VERSION}"
-schema_version = 1
-authors = ["Autohand AI <team@autohand.ai>"]
-description = "AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP). Features include file editing, code search, terminal commands, and intelligent code assistance."
-repository = "https://github.com/${{ github.repository }}"
+          cat > extension.toml << TOMLEOF
+          id = "autohand-acp"
+          name = "Autohand CLI"
+          version = "$VERSION"
+          schema_version = 1
+          authors = ["Autohand AI <team@autohand.ai>"]
+          description = "AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP). Features include file editing, code search, terminal commands, and intelligent code assistance."
+          repository = "https://github.com/$REPO"
 
-[agent_servers.autohand]
-name = "Autohand CLI"
-icon = "icons/autohand.svg"
+          [agent_servers.autohand]
+          name = "Autohand CLI"
+          icon = "icons/autohand.svg"
 
-[agent_servers.autohand.env]
-AUTOHAND_PERMISSION_MODE = "external"
+          [agent_servers.autohand.env]
+          AUTOHAND_PERMISSION_MODE = "external"
 
-[agent_servers.autohand.targets.darwin-aarch64]
-archive = "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/autohand-acp-darwin-arm64.tar.gz"
-sha256 = "${DARWIN_ARM64_SHA}"
-cmd = "./autohand-acp"
+          [agent_servers.autohand.targets.darwin-aarch64]
+          archive = "https://github.com/$REPO/releases/download/v$VERSION/autohand-acp-darwin-arm64.tar.gz"
+          sha256 = "$DARWIN_ARM64_SHA"
+          cmd = "./autohand-acp"
 
-[agent_servers.autohand.targets.darwin-x86_64]
-archive = "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/autohand-acp-darwin-x64.tar.gz"
-sha256 = "${DARWIN_X64_SHA}"
-cmd = "./autohand-acp"
+          [agent_servers.autohand.targets.darwin-x86_64]
+          archive = "https://github.com/$REPO/releases/download/v$VERSION/autohand-acp-darwin-x64.tar.gz"
+          sha256 = "$DARWIN_X64_SHA"
+          cmd = "./autohand-acp"
 
-[agent_servers.autohand.targets.linux-x86_64]
-archive = "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/autohand-acp-linux-x64.tar.gz"
-sha256 = "${LINUX_X64_SHA}"
-cmd = "./autohand-acp"
+          [agent_servers.autohand.targets.linux-x86_64]
+          archive = "https://github.com/$REPO/releases/download/v$VERSION/autohand-acp-linux-x64.tar.gz"
+          sha256 = "$LINUX_X64_SHA"
+          cmd = "./autohand-acp"
 
-[agent_servers.autohand.targets.windows-x86_64]
-archive = "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/autohand-acp-windows-x64.zip"
-sha256 = "${WINDOWS_X64_SHA}"
-cmd = "./autohand-acp.exe"
-EOF
+          [agent_servers.autohand.targets.windows-x86_64]
+          archive = "https://github.com/$REPO/releases/download/v$VERSION/autohand-acp-windows-x64.zip"
+          sha256 = "$WINDOWS_X64_SHA"
+          cmd = "./autohand-acp.exe"
+          TOMLEOF
 
+          # Remove leading spaces from heredoc
+          sed -i 's/^          //' extension.toml
           cat extension.toml
 
       - name: Commit and push updated extension.toml
