@@ -15,16 +15,20 @@ AUTOHAND_PERMISSION_MODE = "external"
 
 [agent_servers.autohand.targets.darwin-aarch64]
 archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.3/autohand-acp-darwin-arm64.tar.gz"
+sha256 = "e62328e2f2545c1221be1899e5725a6d52f48ef32a4a5b7dc4336ed7901a46af"
 cmd = "./autohand-acp"
 
 [agent_servers.autohand.targets.darwin-x86_64]
 archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.3/autohand-acp-darwin-x64.tar.gz"
+sha256 = "b35366fb7518cf2e23172ddaec591ca07f439ce3e762f7a8ffa93a13c724a7f7"
 cmd = "./autohand-acp"
 
 [agent_servers.autohand.targets.linux-x86_64]
 archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.3/autohand-acp-linux-x64.tar.gz"
+sha256 = "5a2db17d0b812a7cbde69997a58f2816a58df829ed1354ee0580ed1d8471086b"
 cmd = "./autohand-acp"
 
 [agent_servers.autohand.targets.windows-x86_64]
 archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.3/autohand-acp-windows-x64.zip"
+sha256 = "96d4bbcfedc21bb0a116d56083a1487827183e27d79c1b78e5b967255d32a8a4"
 cmd = "./autohand-acp.exe"
