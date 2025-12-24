@@ -1,0 +1,128 @@
+name: Submit to Zed Registry
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to submit (e.g., 0.1.1)'
+        required: true
+
+jobs:
+  submit-to-zed:
+    name: Submit to Zed Extension Registry
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout autohand-acp
+        uses: actions/checkout@v4
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            VERSION="${{ github.event.release.tag_name }}"
+            VERSION="${VERSION#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Clone zed-industries/extensions
+        run: |
+          git clone https://github.com/zed-industries/extensions.git zed-extensions
+          cd zed-extensions
+
+      - name: Check if extension exists
+        id: check
+        run: |
+          cd zed-extensions
+          if [ -d "extensions/autohand-acp" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Extension already in registry, will update version"
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "New extension, will add submodule"
+          fi
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add/Update extension
+        run: |
+          cd zed-extensions
+
+          if [ "${{ steps.check.outputs.exists }}" = "false" ]; then
+            # Add as new submodule
+            git submodule add https://github.com/${{ github.repository }}.git extensions/autohand-acp
+          fi
+
+          # Update extensions.toml
+          if ! grep -q "autohand-acp" extensions.toml; then
+            echo "" >> extensions.toml
+            echo "[autohand-acp]" >> extensions.toml
+            echo 'submodule = "extensions/autohand-acp"' >> extensions.toml
+            echo 'version = "${{ steps.version.outputs.version }}"' >> extensions.toml
+          else
+            # Update version
+            sed -i 's/\(\[autohand-acp\]\n.*\nversion = \)"[^"]*"/\1"${{ steps.version.outputs.version }}"/' extensions.toml || true
+          fi
+
+      - name: Create PR info
+        run: |
+          cat << 'EOF'
+          ================================================
+          MANUAL STEP REQUIRED
+          ================================================
+
+          To complete the submission to the Zed Extension Registry:
+
+          1. Fork https://github.com/zed-industries/extensions
+
+          2. Add the extension as a submodule:
+             cd extensions
+             git submodule add https://github.com/${{ github.repository }}.git extensions/autohand-acp
+
+          3. Add to extensions.toml:
+             [autohand-acp]
+             submodule = "extensions/autohand-acp"
+             version = "${{ steps.version.outputs.version }}"
+
+          4. Run: pnpm sort-extensions
+
+          5. Commit and create a PR to zed-industries/extensions
+
+          PR Title: Add autohand-acp extension v${{ steps.version.outputs.version }}
+
+          PR Description:
+          ## Extension: Autohand CLI
+
+          AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP).
+
+          ### Features
+          - File editing and code modifications
+          - Code search across codebase
+          - Terminal command execution
+          - Session management and history
+          - Permission controls (external/auto/restricted)
+          - Dynamic session titles
+          - Image/screenshot support
+
+          ### Links
+          - Repository: https://github.com/${{ github.repository }}
+          - Releases: https://github.com/${{ github.repository }}/releases
+
+          ================================================
+          EOF
+
+      - name: Upload PR template
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-registry-pr-template
+          path: |
+            README.md
+            extension.toml
+            LICENSE

@@ -129,3 +129,84 @@ jobs:
         run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  update-extension-toml:
+    name: Update extension.toml with SHA256
+    runs-on: ubuntu-latest
+    needs: build-artifacts
+    if: github.event_name == 'release'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Get release version
+        id: version
+        run: |
+          VERSION="${{ github.event.release.tag_name }}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Update extension.toml with SHA256 hashes
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+
+          # Read SHA256 hashes
+          DARWIN_ARM64_SHA=$(cat artifacts/autohand-acp-darwin-arm64.tar.gz/autohand-acp-darwin-arm64.tar.gz.sha256)
+          DARWIN_X64_SHA=$(cat artifacts/autohand-acp-darwin-x64.tar.gz/autohand-acp-darwin-x64.tar.gz.sha256)
+          LINUX_X64_SHA=$(cat artifacts/autohand-acp-linux-x64.tar.gz/autohand-acp-linux-x64.tar.gz.sha256)
+          WINDOWS_X64_SHA=$(cat artifacts/autohand-acp-windows-x64.zip/autohand-acp-windows-x64.zip.sha256)
+
+          # Update extension.toml
+          cat > extension.toml << EOF
+          id = "autohand-acp"
+          name = "Autohand CLI"
+          version = "${VERSION}"
+          schema_version = 1
+          authors = ["Autohand AI <team@autohand.ai>"]
+          description = "AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP). Features include file editing, code search, terminal commands, and intelligent code assistance."
+          repository = "https://github.com/${{ github.repository }}"
+
+          [agent_servers.autohand]
+          name = "Autohand CLI"
+          icon = "icons/autohand.svg"
+
+          [agent_servers.autohand.env]
+          AUTOHAND_PERMISSION_MODE = "external"
+
+          [agent_servers.autohand.targets.darwin-aarch64]
+          archive = "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/autohand-acp-darwin-arm64.tar.gz"
+          sha256 = "${DARWIN_ARM64_SHA}"
+          cmd = "./autohand-acp"
+
+          [agent_servers.autohand.targets.darwin-x86_64]
+          archive = "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/autohand-acp-darwin-x64.tar.gz"
+          sha256 = "${DARWIN_X64_SHA}"
+          cmd = "./autohand-acp"
+
+          [agent_servers.autohand.targets.linux-x86_64]
+          archive = "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/autohand-acp-linux-x64.tar.gz"
+          sha256 = "${LINUX_X64_SHA}"
+          cmd = "./autohand-acp"
+
+          [agent_servers.autohand.targets.windows-x86_64]
+          archive = "https://github.com/${{ github.repository }}/releases/download/v${VERSION}/autohand-acp-windows-x64.zip"
+          sha256 = "${WINDOWS_X64_SHA}"
+          cmd = "./autohand-acp.exe"
+          EOF
+
+          cat extension.toml
+
+      - name: Commit and push updated extension.toml
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add extension.toml
+          git commit -m "chore: update extension.toml with SHA256 hashes for v${{ steps.version.outputs.version }}" || exit 0
+          git push origin HEAD:main

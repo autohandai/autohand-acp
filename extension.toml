@@ -1,16 +1,17 @@
 id = "autohand-acp"
-name = "Autohand ACP"
+name = "Autohand CLI"
 version = "0.1.1"
 schema_version = 1
 authors = ["Autohand AI <team@autohand.ai>"]
-description = "Agent Server extension that runs the Autohand CLI over ACP."
+description = "AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP). Features include file editing, code search, terminal commands, and intelligent code assistance."
 repository = "https://github.com/autohandai/autohand-acp"
 
 [agent_servers.autohand]
-name = "Autohand"
+name = "Autohand CLI"
+icon = "icons/autohand.svg"
 
 [agent_servers.autohand.env]
-AUTOHAND_PERMISSION_MODE = "auto"
+AUTOHAND_PERMISSION_MODE = "external"
 
 [agent_servers.autohand.targets.darwin-aarch64]
 archive = "https://github.com/autohandai/autohand-acp/releases/download/v0.1.1/autohand-acp-darwin-arm64.tar.gz"

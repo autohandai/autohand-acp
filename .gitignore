@@ -3,3 +3,9 @@ dist/
 .DS_Store
 .env
 npm-debug.log*
+
+# Build outputs
+dist-local/
+
+# Temp files
+.tmp-*/

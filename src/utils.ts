@@ -93,3 +93,11 @@ export function truncateText(text: string, maxChars: number): string {
   }
   return `${text.slice(0, maxChars)}\n[truncated ${text.length - maxChars} chars]`;
 }
+
+/**
+ * Strip ANSI escape codes from text.
+ * Removes color codes, cursor control, and other terminal sequences.
+ */
+export function stripAnsi(text: string): string {
+  return text.replace(/\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~]|\].*?(?:\x07|\x1B\\))/g, "");
+}

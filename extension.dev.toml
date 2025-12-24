@@ -1,0 +1,37 @@
+# Development version - point archive URLs to local server
+# Usage:
+#   1. Run: ./scripts/build-local.sh
+#   2. Run: cd dist-local && python3 -m http.server 8765
+#   3. Copy this file to extension.toml
+#   4. In Zed: "zed: install dev extension" -> select this directory
+
+id = "autohand-acp"
+name = "Autohand CLI (Dev)"
+version = "0.1.1-dev"
+schema_version = 1
+authors = ["Autohand AI <team@autohand.ai>"]
+description = "AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP)."
+repository = "https://github.com/autohandai/autohand-acp"
+
+[agent_servers.autohand]
+name = "Autohand CLI"
+icon = "icons/autohand.svg"
+
+[agent_servers.autohand.env]
+AUTOHAND_PERMISSION_MODE = "external"
+
+[agent_servers.autohand.targets.darwin-aarch64]
+archive = "http://localhost:8765/autohand-acp-darwin-arm64.tar.gz"
+cmd = "./autohand-acp"
+
+[agent_servers.autohand.targets.darwin-x86_64]
+archive = "http://localhost:8765/autohand-acp-darwin-x64.tar.gz"
+cmd = "./autohand-acp"
+
+[agent_servers.autohand.targets.linux-x86_64]
+archive = "http://localhost:8765/autohand-acp-linux-x64.tar.gz"
+cmd = "./autohand-acp"
+
+[agent_servers.autohand.targets.windows-x86_64]
+archive = "http://localhost:8765/autohand-acp-windows-x64.zip"
+cmd = "./autohand-acp.exe"
