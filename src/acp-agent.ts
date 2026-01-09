@@ -59,6 +59,7 @@ import {
   truncateText,
 } from "./utils.js";
 import { createPermissionServer, type PermissionServer } from "./permission-server.js";
+import { getTelemetryClient } from "./telemetry.js";
 
 const DEFAULT_HISTORY_LIMIT = 6;
 const DEFAULT_MAX_HISTORY_CHARS = 8000;
@@ -342,6 +343,10 @@ export class AutohandAcpAgent implements Agent {
     if (configOptions.length > 0) {
       response.configOptions = configOptions;
     }
+
+    // Track session start in telemetry
+    const currentModel = availableModels.find(m => m.modelId === modelId);
+    void getTelemetryClient().startSession(sessionId, currentModel?.name || modelId);
 
     // Send commands notification AFTER the response is returned
     // Use setImmediate to ensure the response is sent first
@@ -760,6 +765,9 @@ export class AutohandAcpAgent implements Agent {
         session.permissionServer = undefined;
       }
 
+      // Ensure all pending notifications are sent before returning
+      await session.updateQueue.catch(() => {});
+
       if (session.cancelled) {
         return { stopReason: "cancelled" };
       }
@@ -859,6 +867,8 @@ export class AutohandAcpAgent implements Agent {
     ]);
 
     if (session.cancelled) {
+      // Ensure all pending notifications are sent before returning
+      await session.updateQueue.catch(() => {});
       return { stopReason: "cancelled" };
     }
 
@@ -892,6 +902,11 @@ export class AutohandAcpAgent implements Agent {
       session.permissionServer = undefined;
     }
 
+    // Ensure all pending notifications are sent before returning
+    // This prevents race conditions where Zed thinks turn is complete
+    // but there are still messages being streamed
+    await session.updateQueue.catch(() => {});
+
     return { stopReason: "end_turn" };
   }
 
@@ -902,6 +917,9 @@ export class AutohandAcpAgent implements Agent {
     }
 
     session.cancelled = true;
+
+    // Track session end in telemetry
+    void getTelemetryClient().endSession("abandoned");
 
     // Clean up permission server
     if (session.permissionServer) {
@@ -1051,6 +1069,9 @@ export class AutohandAcpAgent implements Agent {
     parsed: { command: string; args: string[] },
   ): Promise<{ handled: boolean }> {
     const { command, args } = parsed;
+
+    // Track command usage in telemetry
+    void getTelemetryClient().trackCommand(command, args);
 
     // Handle /help locally
     if (command === "help" || command === "?") {
