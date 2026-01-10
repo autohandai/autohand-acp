@@ -61,6 +61,14 @@ import {
 import { createPermissionServer, type PermissionServer } from "./permission-server.js";
 import { getTelemetryClient } from "./telemetry.js";
 
+const DEBUG_LOG_FILE = "/tmp/autohand-acp-debug.log";
+
+async function debugLog(message: string): Promise<void> {
+  const timestamp = new Date().toISOString();
+  const line = `[${timestamp}] ${message}\n`;
+  await fs.appendFile(DEBUG_LOG_FILE, line).catch(() => {});
+}
+
 const DEFAULT_HISTORY_LIMIT = 6;
 const DEFAULT_MAX_HISTORY_CHARS = 8000;
 const DEFAULT_PERMISSION_MODE = "auto";
@@ -426,11 +434,8 @@ export class AutohandAcpAgent implements Agent {
     // Apply the config change to environment/state
     await this.applyConfigOption(session, configId, newValue);
 
-    // Notify client of the update
-    await this.queueSessionUpdate(session, {
-      sessionUpdate: "config_option_update",
-      configOptions: session.configOptions,
-    });
+    // Note: config_option_update is not a valid ACP notification type in Zed
+    // The config options are returned in the response instead
 
     return { configOptions: session.configOptions };
   }
@@ -557,14 +562,8 @@ export class AutohandAcpAgent implements Agent {
 
     const session = this.sessions.get(sessionIdToResume)!;
 
-    // Send session info update with title
-    setImmediate(() => {
-      void this.queueSessionUpdate(session, {
-        sessionUpdate: "session_info_update",
-        title: session.title,
-        updatedAt: new Date().toISOString(),
-      });
-    });
+    // Note: session_info_update is not a valid ACP notification type in Zed
+    // The title is set on the session object but we can't notify Zed about it
 
     const response: ResumeSessionResponse = {};
     if (availableModes.length > 0) {
@@ -614,6 +613,7 @@ export class AutohandAcpAgent implements Agent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
+    void debugLog(`prompt() called for session ${params.sessionId}`);
     const session = this.sessions.get(params.sessionId);
     if (!session) {
       throw RequestError.invalidParams({
@@ -627,7 +627,9 @@ export class AutohandAcpAgent implements Agent {
     const thisPrompt = previousPrompt.then(() => this.executePrompt(session, params));
     session.promptQueue = thisPrompt.catch(() => ({ stopReason: "end_turn" as const }));
 
-    return thisPrompt;
+    const result = await thisPrompt;
+    void debugLog(`prompt() returning: ${JSON.stringify(result)}`);
+    return result;
   }
 
   private async executePrompt(session: SessionState, params: PromptRequest): Promise<PromptResponse> {
@@ -643,13 +645,8 @@ export class AutohandAcpAgent implements Agent {
     if (!session.titleGenerated && userText.trim()) {
       session.title = generateSessionTitle(userText);
       session.titleGenerated = true;
-
-      // Send session info update with the new title
-      await this.queueSessionUpdate(session, {
-        sessionUpdate: "session_info_update",
-        title: session.title,
-        updatedAt: new Date().toISOString(),
-      });
+      // Note: session_info_update is not a valid ACP notification type in Zed
+      // The title is stored locally but we can't notify Zed about it
     }
 
     // Check for slash commands
@@ -907,6 +904,7 @@ export class AutohandAcpAgent implements Agent {
     // but there are still messages being streamed
     await session.updateQueue.catch(() => {});
 
+    void debugLog(`About to return end_turn for session ${session.id}`);
     return { stopReason: "end_turn" };
   }
 
