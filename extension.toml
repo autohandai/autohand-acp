@@ -1,6 +1,6 @@
 id = "autohand-acp"
 name = "Autohand CLI"
-version = "v0.1.5"
+version = "v0.1.6"
 schema_version = 1
 authors = ["Autohand AI <team@autohand.ai>"]
 description = "AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP). Features include file editing, code search, terminal commands, and intelligent code assistance."
@@ -14,21 +14,21 @@ icon = "icons/autohand.svg"
 AUTOHAND_PERMISSION_MODE = "external"
 
 [agent_servers.autohand.targets.darwin-aarch64]
-archive = "https://github.com/autohandai/autohand-acp/releases/download/vv0.1.5/autohand-acp-darwin-arm64.tar.gz"
-sha256 = "17e5d579db661b6aeb1260e110ed21aac376ffcd8f52c11201bd32328c651635"
+archive = "https://github.com/autohandai/autohand-acp/releases/download/vv0.1.6/autohand-acp-darwin-arm64.tar.gz"
+sha256 = "18bfbb9d72f35f5560a5432b3a7f7416265392f96fe0653f8665392a098f74c8"
 cmd = "./autohand-acp"
 
 [agent_servers.autohand.targets.darwin-x86_64]
-archive = "https://github.com/autohandai/autohand-acp/releases/download/vv0.1.5/autohand-acp-darwin-x64.tar.gz"
-sha256 = "0487c9a4b95f56dbabad48f0514f2916afd2df831ed28066c30afdc07b0fb101"
+archive = "https://github.com/autohandai/autohand-acp/releases/download/vv0.1.6/autohand-acp-darwin-x64.tar.gz"
+sha256 = "312e4c0ef24a69d6168e05ed55424d24819cef2cf91f4c7c90c048430466fdff"
 cmd = "./autohand-acp"
 
 [agent_servers.autohand.targets.linux-x86_64]
-archive = "https://github.com/autohandai/autohand-acp/releases/download/vv0.1.5/autohand-acp-linux-x64.tar.gz"
-sha256 = "a4ae6ee7d61ed64d702b0725783c2c92bb17bcca567d4be5deec47f1d88abf8c"
+archive = "https://github.com/autohandai/autohand-acp/releases/download/vv0.1.6/autohand-acp-linux-x64.tar.gz"
+sha256 = "fd68c1cf3ad1346f8d83299ca2d806d28de0456f84bcc81052dfe5ec06b19d59"
 cmd = "./autohand-acp"
 
 [agent_servers.autohand.targets.windows-x86_64]
-archive = "https://github.com/autohandai/autohand-acp/releases/download/vv0.1.5/autohand-acp-windows-x64.zip"
-sha256 = "dfc7e9ecec774b570529eff4675cb054f512cbcdf7a80afbe4b12a2c008bcfc0"
+archive = "https://github.com/autohandai/autohand-acp/releases/download/vv0.1.6/autohand-acp-windows-x64.zip"
+sha256 = "097a1ff27848030630f509b7013ab8d41fd0cc20db0afe2b4b449c59acec41bf"
 cmd = "./autohand-acp.exe"

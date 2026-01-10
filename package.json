@@ -1,6 +1,6 @@
 {
   "name": "@autohandai/autohand-acp",
-  "version": "v0.1.5",
+  "version": "v0.1.6",
   "description": "ACP adapter for the Autohand CLI",
   "type": "module",
   "bin": {

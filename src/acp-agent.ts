@@ -223,6 +223,14 @@ type SessionMessage = {
   _meta?: Record<string, unknown>;
 };
 
+type ParsedAssistantContent = {
+  raw: string;
+  thought?: string;
+  response?: string;
+  toolCalls?: ToolCallRecord[];
+  structured: boolean;
+};
+
 type SessionState = {
   id: string;
   cwd: string;
@@ -780,56 +788,16 @@ export class AutohandAcpAgent implements Agent {
 
     session.activeProcess = child;
 
-    // Stream stdout text to UI but don't accumulate in memory
-    // Structured events (tool calls) come from conversation.jsonl
+    // Structured events (tool calls, thoughts, responses) come from conversation.jsonl
+    // Stdout is used only for real-time progress during tool execution
+    // We filter out internal messages and avoid duplicating agent content
     let stderrOutput = "";
     const MAX_STDERR = 8000;
-    let thinkingBuffer = "";
-    let inThinkingBlock = false;
 
-    const onStdout = (chunk: Buffer) => {
-      const text = stripAnsi(chunk.toString("utf8"));
-      if (!text) return;
-
-      // Filter out hook messages and completion stats - they're internal
-      if (text.match(/\[hook:[^\]]+\]/) ||
-          text.match(/^Turn complete:/i) ||
-          text.match(/^Completed in \d+/i)) {
-        return;
-      }
-
-      // Detect thinking blocks (e.g., <thinking>...</thinking>)
-      if (text.includes("<thinking>")) {
-        inThinkingBlock = true;
-        thinkingBuffer = "";
-      }
-
-      if (inThinkingBlock) {
-        thinkingBuffer += text;
-        if (text.includes("</thinking>")) {
-          inThinkingBlock = false;
-          // Emit as thought chunk
-          const thoughtContent = thinkingBuffer
-            .replace(/<\/?thinking>/g, "")
-            .trim();
-          if (thoughtContent) {
-            void this.queueThoughtUpdate(session, thoughtContent);
-          }
-          thinkingBuffer = "";
-        }
-        return; // Don't emit thinking content as regular message
-      }
-
-      // Check if this looks like reasoning/thinking content
-      if (isThinkingContent(text)) {
-        // Strip common thinking prefixes for cleaner display
-        const cleanedThought = text
-          .replace(/^(?:thinking|Thinking):\s*/i, "")
-          .trim();
-        void this.queueThoughtUpdate(session, cleanedThought || text);
-      } else {
-        void this.queueTextUpdate(session, text);
-      }
+    const onStdout = (_chunk: Buffer) => {
+      // Stdout is intentionally not processed for agent messages
+      // All structured content (thought, finalResponse) comes from conversation.jsonl
+      // This prevents duplicate messages and ensures proper thought/response separation
     };
 
     const onStderr = (chunk: Buffer) => {
@@ -1045,16 +1013,20 @@ export class AutohandAcpAgent implements Agent {
               sessionUpdate: "user_message_chunk",
               content: { type: "text", text: message.content },
             });
-          } else if (message.role === "assistant" && message.content) {
-            await this.queueSessionUpdate(session, {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: message.content },
-            });
-          }
-
-          // Add to session history for context
-          if (message.role === "user" || message.role === "assistant") {
             session.history.push(message);
+          } else if (message.role === "assistant" && message.content) {
+            const parsed = parseAssistantContent(message.content);
+            const toolCalls = Array.isArray(message.toolCalls)
+              ? message.toolCalls
+              : parsed.toolCalls;
+            const responseText = resolveAssistantResponse(parsed, toolCalls);
+            if (responseText) {
+              await this.queueSessionUpdate(session, {
+                sessionUpdate: "agent_message_chunk",
+                content: { type: "text", text: responseText },
+              });
+              session.history.push({ role: "assistant", content: responseText });
+            }
           }
         } catch {
           // Skip invalid JSON lines
@@ -1350,51 +1322,6 @@ export class AutohandAcpAgent implements Agent {
     return { handled: true };
   }
 
-  private async showSessionPicker(
-    session: SessionState,
-    sessions: Array<{ id: string; projectPath: string; createdAt: string }>,
-  ): Promise<string | null> {
-    const options: Array<{ optionId: string; name: string; kind: "allow_once" | "reject_once" }> = sessions.map((s) => ({
-      optionId: s.id,
-      name: `${s.id.slice(0, 8)} - ${path.basename(s.projectPath)} (${s.createdAt.split("T")[0]})`,
-      kind: "allow_once" as const,
-    }));
-
-    // Add cancel option
-    options.push({
-      optionId: "__cancel__",
-      name: "Cancel",
-      kind: "reject_once",
-    });
-
-    try {
-      const response = await this.client.requestPermission({
-        sessionId: session.id,
-        options,
-        _meta: {
-          title: "Select a session to resume",
-          description: "Choose from your recent Autohand sessions",
-        },
-      });
-
-      if (response.outcome.outcome === "cancelled") {
-        return null;
-      }
-
-      if (response.outcome.outcome === "selected") {
-        const selectedId = response.outcome.optionId;
-        if (selectedId === "__cancel__") {
-          return null;
-        }
-        return selectedId;
-      }
-
-      return null;
-    } catch {
-      return null;
-    }
-  }
-
   private async showModelPicker(session: SessionState): Promise<string | null> {
     if (session.availableModels.length === 0) {
       return null;
@@ -1570,10 +1497,24 @@ export class AutohandAcpAgent implements Agent {
 
   private async handleSessionMessage(session: SessionState, message: SessionMessage): Promise<void> {
     if (message.role === "assistant") {
-      // Handle tool calls from conversation.jsonl
-      // Text content comes from stdout streaming, not here (avoid duplicates)
-      if (Array.isArray(message.toolCalls)) {
-        for (const call of message.toolCalls) {
+      const parsed = message.content ? parseAssistantContent(message.content) : null;
+      const toolCalls = Array.isArray(message.toolCalls)
+        ? message.toolCalls
+        : parsed?.toolCalls;
+
+      if (parsed?.thought && hasText(parsed.thought)) {
+        await this.queueThoughtUpdate(session, parsed.thought);
+      }
+
+      const responseText = parsed ? resolveAssistantResponse(parsed, toolCalls) : null;
+      if (responseText) {
+        await this.queueTextUpdate(session, responseText + "\n");
+        session.history.push({ role: "assistant", content: responseText });
+      }
+
+      // Handle tool calls
+      if (Array.isArray(toolCalls)) {
+        for (const call of toolCalls) {
           await this.handleToolCallStart(session, call);
         }
       }
@@ -1959,6 +1900,74 @@ export class AutohandAcpAgent implements Agent {
       return false;
     }
   }
+}
+
+function hasText(value?: string | null): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function parseAssistantContent(raw: string): ParsedAssistantContent {
+  const trimmed = raw.trim();
+  if (!hasText(trimmed)) {
+    return { raw, structured: false };
+  }
+
+  if (!(trimmed.startsWith("{") || trimmed.startsWith("["))) {
+    return { raw, response: raw, structured: false };
+  }
+
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (!parsed || typeof parsed !== "object") {
+      return { raw, response: raw, structured: false };
+    }
+
+    const record = parsed as Record<string, unknown>;
+    const structured =
+      "thought" in record ||
+      "toolCalls" in record ||
+      "finalResponse" in record ||
+      "response" in record;
+
+    if (!structured) {
+      return { raw, response: raw, structured: false };
+    }
+
+    return {
+      raw,
+      structured: true,
+      thought: typeof record.thought === "string" ? record.thought : undefined,
+      response:
+        typeof record.finalResponse === "string"
+          ? record.finalResponse
+          : typeof record.response === "string"
+            ? record.response
+            : undefined,
+      toolCalls: Array.isArray(record.toolCalls) ? (record.toolCalls as ToolCallRecord[]) : undefined,
+    };
+  } catch {
+    return { raw, response: raw, structured: false };
+  }
+}
+
+function resolveAssistantResponse(
+  parsed: ParsedAssistantContent,
+  toolCalls?: ToolCallRecord[] | null,
+): string | null {
+  if (hasText(parsed.response)) {
+    return parsed.response;
+  }
+
+  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+  if (!hasToolCalls && hasText(parsed.thought)) {
+    return parsed.thought;
+  }
+
+  if (!parsed.structured && hasText(parsed.raw)) {
+    return parsed.raw;
+  }
+
+  return null;
 }
 
 function promptToText(prompt: ContentBlock[]): string {
@@ -2491,22 +2500,6 @@ function buildConfigOptions(): SessionConfigOption[] {
       ],
     },
   ];
-}
-
-/**
- * Check if text appears to be agent "thinking" or reasoning.
- */
-function isThinkingContent(text: string): boolean {
-  const thinkingPatterns = [
-    /^(?:thinking|let me think|i'm thinking|considering|analyzing)/i,
-    /^<thinking>/i,
-    /^<reasoning>/i,
-    /^\*thinking\*/i,
-    /^I need to /i,
-    /^First, I'll /i,
-    /^Let me analyze/i,
-  ];
-  return thinkingPatterns.some((pattern) => pattern.test(text.trim()));
 }
 
 export function runAcp(): void {
