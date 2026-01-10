@@ -1,0 +1,26 @@
+[
+  {
+    "id": "1",
+    "title": "Review the diff for AI-generated slop",
+    "status": "completed",
+    "description": "Analyzed the changes in src/acp-agent.ts and tests/e2e/acp-agent.test.mjs to identify AI-generated slop."
+  },
+  {
+    "id": "2",
+    "title": "Remove AI-generated slop from src/acp-agent.ts",
+    "status": "completed",
+    "description": "Removed unnecessary comments, defensive checks, and other AI-generated slop from src/acp-agent.ts."
+  },
+  {
+    "id": "3",
+    "title": "Remove AI-generated slop from tests/e2e/acp-agent.test.mjs",
+    "status": "completed",
+    "description": "Removed unnecessary comments and other AI-generated slop from tests/e2e/acp-agent.test.mjs."
+  },
+  {
+    "id": "4",
+    "title": "Verify changes",
+    "status": "completed",
+    "description": "Ensured the changes are clean and consistent with the rest of the codebase."
+  }
+]

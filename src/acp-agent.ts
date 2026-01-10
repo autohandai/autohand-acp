@@ -857,15 +857,19 @@ export class AutohandAcpAgent implements Agent {
     session.activeProcess = undefined;
     tailAbort.abort();
 
+    void debugLog(`CLI exited, waiting for tail...`);
+
     // Wait for tail with timeout to prevent hanging
     await Promise.race([
       tailPromise,
       sleep(2000), // 2 second timeout
     ]);
 
+    void debugLog(`Tail done, checking cancelled state...`);
+
     if (session.cancelled) {
-      // Ensure all pending notifications are sent before returning
-      await session.updateQueue.catch(() => {});
+      void debugLog(`Session cancelled, draining queue...`);
+      await Promise.race([session.updateQueue.catch(() => {}), sleep(1000)]);
       return { stopReason: "cancelled" };
     }
 
@@ -877,7 +881,6 @@ export class AutohandAcpAgent implements Agent {
     }
 
     if (exitResult.code !== 0 && exitResult.code !== null) {
-      // Show exit code and any stderr for debugging
       let errorMsg = `Autohand exited with code ${exitResult.code}.\n`;
       if (stderrOutput.trim()) {
         errorMsg += `\n${stderrOutput.trim()}\n`;
@@ -899,10 +902,11 @@ export class AutohandAcpAgent implements Agent {
       session.permissionServer = undefined;
     }
 
+    void debugLog(`Draining update queue...`);
+
     // Ensure all pending notifications are sent before returning
-    // This prevents race conditions where Zed thinks turn is complete
-    // but there are still messages being streamed
-    await session.updateQueue.catch(() => {});
+    // Use timeout to prevent hanging
+    await Promise.race([session.updateQueue.catch(() => {}), sleep(2000)]);
 
     void debugLog(`About to return end_turn for session ${session.id}`);
     return { stopReason: "end_turn" };
