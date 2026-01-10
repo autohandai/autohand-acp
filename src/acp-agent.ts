@@ -791,6 +791,13 @@ export class AutohandAcpAgent implements Agent {
       const text = stripAnsi(chunk.toString("utf8"));
       if (!text) return;
 
+      // Filter out hook messages and completion stats - they're internal
+      if (text.match(/\[hook:[^\]]+\]/) ||
+          text.match(/^Turn complete:/i) ||
+          text.match(/^Completed in \d+/i)) {
+        return;
+      }
+
       // Detect thinking blocks (e.g., <thinking>...</thinking>)
       if (text.includes("<thinking>")) {
         inThinkingBlock = true;
@@ -815,7 +822,11 @@ export class AutohandAcpAgent implements Agent {
 
       // Check if this looks like reasoning/thinking content
       if (isThinkingContent(text)) {
-        void this.queueThoughtUpdate(session, text);
+        // Strip common thinking prefixes for cleaner display
+        const cleanedThought = text
+          .replace(/^(?:thinking|Thinking):\s*/i, "")
+          .trim();
+        void this.queueThoughtUpdate(session, cleanedThought || text);
       } else {
         void this.queueTextUpdate(session, text);
       }
