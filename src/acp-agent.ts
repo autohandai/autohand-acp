@@ -413,58 +413,79 @@ export class AutohandAcpAgent implements Agent {
 
   async authenticate(params: AuthenticateRequest): Promise<AuthenticateResponse> {
     const methodId = params?.methodId ?? "login";
-    const autohandCmd = findAutohandBinary();
 
-    if (methodId === "login") {
-      // Spawn autohand login - it opens browser for OAuth
-      return new Promise((resolve, reject) => {
-        const child = spawn(autohandCmd, ["login"], {
-          stdio: ["ignore", "pipe", "pipe"],
-          detached: false,
-        });
-
-        let stderr = "";
-        child.stderr?.on("data", (data) => {
-          stderr += data.toString();
-        });
-
-        child.on("error", (err) => {
-          reject(RequestError.invalidRequest({
-            details: `Failed to start login: ${err.message}. Please run 'autohand login' manually in your terminal.`,
-          }));
-        });
-
-        child.on("close", (code) => {
-          if (code === 0) {
-            resolve({});
-          } else {
-            reject(RequestError.invalidRequest({
-              details: stderr || `Login failed with exit code ${code}. Please run 'autohand login' manually.`,
-            }));
-          }
-        });
-
-        // Timeout after 2 minutes (login should complete via browser)
-        setTimeout(() => {
-          child.kill();
-          reject(RequestError.invalidRequest({
-            details: "Login timed out. Please run 'autohand login' manually in your terminal.",
-          }));
-        }, 120000);
-      });
-    } else if (methodId === "feedback") {
-      // Feedback needs interactive terminal - provide instructions
+    // Check if client supports terminal
+    if (!this.clientCapabilities?.terminal) {
+      const action = methodId === "login" ? "login" : "feedback";
       throw RequestError.invalidRequest({
-        details: "To send feedback, please run `autohand feedback` in your terminal.",
+        details: `Terminal not supported. Please run 'autohand ${action}' manually in your terminal.`,
       });
     }
 
-    return {};
+    const autohandCmd = findAutohandBinary();
+    let command: string;
+    let args: string[];
+    let title: string;
+
+    if (methodId === "login") {
+      command = autohandCmd;
+      args = ["login"];
+      title = "Autohand Login";
+    } else if (methodId === "feedback") {
+      command = autohandCmd;
+      args = ["feedback"];
+      title = "Autohand Feedback";
+    } else {
+      throw RequestError.invalidParams({
+        details: `Unknown auth method: ${methodId}`,
+      });
+    }
+
+    // Create a temporary session ID for the terminal
+    const authSessionId = `auth-${randomUUID()}`;
+
+    try {
+      // Create terminal using the temporary session
+      const terminal = await this.client.createTerminal({
+        sessionId: authSessionId,
+        command,
+        args,
+        title,
+        cwd: process.cwd(),
+      });
+
+      // Wait for terminal to complete
+      const result = await terminal.waitForExit();
+      await terminal.release();
+
+      // Check exit code for login
+      if (methodId === "login" && result.exitCode !== 0) {
+        throw RequestError.invalidRequest({
+          details: `Login failed with exit code ${result.exitCode}. Please try again.`,
+        });
+      }
+
+      return {};
+    } catch (error) {
+      // If it's already a RequestError, rethrow it
+      if (error instanceof Error && "code" in error) {
+        throw error;
+      }
+      // Otherwise wrap it
+      throw RequestError.invalidRequest({
+        details: `Authentication failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+    }
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
-    // Auth is optional - users can use without logging in
-    // The auth banner will show instructions if they want to login
+    // Check if user is authenticated - if not, trigger auth banner
+    const isAuthenticated = await checkAuthStatus();
+    if (!isAuthenticated) {
+      throw RequestError.authRequired({
+        message: "Please login to use Autohand",
+      });
+    }
 
     if (!path.isAbsolute(params.cwd)) {
       throw RequestError.invalidParams({
