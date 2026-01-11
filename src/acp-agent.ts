@@ -61,12 +61,6 @@ import {
 import { createPermissionServer, type PermissionServer } from "./permission-server.js";
 import { getTelemetryClient } from "./telemetry.js";
 
-// Debug logging - disabled for production
-function debugLog(_message: string): void {
-  // No-op in production. Enable by uncommenting:
-  // const DEBUG_LOG_FILE = "/tmp/autohand-acp-debug.log";
-  // void fs.appendFile(DEBUG_LOG_FILE, `[${new Date().toISOString()}] ${_message}\n`).catch(() => {});
-}
 
 const DEFAULT_HISTORY_LIMIT = 6;
 const DEFAULT_MAX_HISTORY_CHARS = 8000;
@@ -258,6 +252,7 @@ type SessionState = {
   stdoutBuffer: string;
   stdoutFallbackTimer?: ReturnType<typeof setTimeout>;
   completionStats?: string;
+  rawStdoutForStats: string; // Buffer all stdout to extract stats after process exits
   useClientTerminal: boolean;
   autohandHome: string;
   permissionServer?: PermissionServer;
@@ -352,6 +347,7 @@ export class AutohandAcpAgent implements Agent {
       hasAgentResponse: false,
       stdoutFallbackActive: false,
       stdoutBuffer: "",
+      rawStdoutForStats: "",
       useClientTerminal,
       autohandHome: resolveAutohandHome(),
       titleGenerated: false,
@@ -493,6 +489,7 @@ export class AutohandAcpAgent implements Agent {
       hasAgentResponse: false,
       stdoutFallbackActive: false,
       stdoutBuffer: "",
+      rawStdoutForStats: "",
       useClientTerminal: parentSession.useClientTerminal,
       autohandHome: parentSession.autohandHome,
       titleGenerated: false,
@@ -578,6 +575,7 @@ export class AutohandAcpAgent implements Agent {
       hasAgentResponse: false,
       stdoutFallbackActive: false,
       stdoutBuffer: "",
+      rawStdoutForStats: "",
       useClientTerminal,
       autohandHome,
       titleGenerated: true, // Don't regenerate title for resumed sessions
@@ -637,7 +635,6 @@ export class AutohandAcpAgent implements Agent {
   }
 
   async prompt(params: PromptRequest): Promise<PromptResponse> {
-    void debugLog(`prompt() called for session ${params.sessionId}`);
     const session = this.sessions.get(params.sessionId);
     if (!session) {
       throw RequestError.invalidParams({
@@ -652,7 +649,6 @@ export class AutohandAcpAgent implements Agent {
     session.promptQueue = thisPrompt.catch(() => ({ stopReason: "end_turn" as const }));
 
     const result = await thisPrompt;
-    void debugLog(`prompt() returning: ${JSON.stringify(result)}`);
     return result;
   }
 
@@ -728,7 +724,6 @@ export class AutohandAcpAgent implements Agent {
       autohandHome: session.autohandHome,
       permissionCallbackUrl,
     });
-    void debugLog(`[runAutohandProcess] command=${command} args=${args.join(" ")}`);
 
     if (configPath && !existsSync(configPath)) {
       await this.queueTextUpdate(
@@ -738,10 +733,8 @@ export class AutohandAcpAgent implements Agent {
     }
 
     const tailAbort = new AbortController();
-    await debugLog(`[runAutohandProcess] Starting trackConversation, sessionsSnapshot.size=${sessionsSnapshot.size}`);
     const tailPromise = this.trackConversation(session, sessionsSnapshot, tailAbort.signal);
 
-    await debugLog(`[runAutohandProcess] useClientTerminal=${session.useClientTerminal}, hasTerminalCap=${!!this.clientCapabilities?.terminal}`);
     if (session.useClientTerminal && this.clientCapabilities?.terminal) {
       const toolCallId = randomUUID();
       const terminal = await this.client.createTerminal({
@@ -838,14 +831,9 @@ export class AutohandAcpAgent implements Agent {
         return;
       }
 
-      // Capture completion stats (time & tokens) for display
-      const statsMatch = text.match(/Completed in ([^·]+)·?\s*([^·\n]*tokens[^\n]*)?/i);
-      if (statsMatch) {
-        const time = statsMatch[1]?.trim() || "";
-        const tokens = statsMatch[2]?.trim() || "";
-        session.completionStats = tokens ? `${time} · ${tokens}` : time;
-        return;
-      }
+      // Always buffer raw stdout for stats extraction after process exits
+      // This avoids issues with stats line being split across chunks
+      session.rawStdoutForStats += text;
 
       // Filter out CLI status messages and internal output
       if (
@@ -853,7 +841,8 @@ export class AutohandAcpAgent implements Agent {
         text.match(/Turn complete:/i) ||
         text.match(/^Thinking:/i) ||
         text.match(/^→/i) ||
-        text.match(/^Step \d+:/i)
+        text.match(/^Step \d+:/i) ||
+        text.match(/Completed in/i) // Stats will be extracted from rawStdoutForStats later
       ) {
         return;
       }
@@ -912,7 +901,6 @@ export class AutohandAcpAgent implements Agent {
       session.stdoutFallbackTimer = undefined;
     }
     if (!session.hasAgentResponse && session.stdoutBuffer) {
-      void debugLog(`[stdoutFallback] Flushing buffered stdout (${session.stdoutBuffer.length} chars)`);
       await this.queueTextUpdate(session, session.stdoutBuffer);
       session.stdoutBuffer = "";
     }
@@ -920,7 +908,6 @@ export class AutohandAcpAgent implements Agent {
     session.activeProcess = undefined;
     tailAbort.abort();
 
-    void debugLog(`CLI exited, waiting for tail...`);
 
     // Wait for tail with timeout to prevent hanging
     await Promise.race([
@@ -928,10 +915,8 @@ export class AutohandAcpAgent implements Agent {
       sleep(2000), // 2 second timeout
     ]);
 
-    void debugLog(`Tail done, checking cancelled state...`);
 
     if (session.cancelled) {
-      void debugLog(`Session cancelled, draining queue...`);
       await Promise.race([session.updateQueue.catch(() => {}), sleep(1000)]);
       return { stopReason: "cancelled" };
     }
@@ -965,16 +950,31 @@ export class AutohandAcpAgent implements Agent {
       session.permissionServer = undefined;
     }
 
+    // Extract completion stats from buffered stdout (avoids chunking issues)
+    const statsMatch = session.rawStdoutForStats.match(
+      /Completed in ([^·\n]+)·?\s*([^·\n]*tokens[^\n]*)?/i
+    );
+    if (statsMatch) {
+      const time = statsMatch[1]?.trim() || "";
+      const tokens = statsMatch[2]?.trim() || "";
+      session.completionStats = tokens ? `${time} · ${tokens}` : time;
+    }
+    session.rawStdoutForStats = ""; // Clear buffer
+
     // Ensure all pending notifications are sent before returning
     // Use timeout to prevent hanging
     await Promise.race([session.updateQueue.catch(() => {}), sleep(2000)]);
 
     // Display completion stats if available (after draining main queue)
     if (session.completionStats) {
-      const statsPromise = this.queueTextUpdate(session, `\n_${session.completionStats}_\n`);
+      this.queueTextUpdate(session, `\n_${session.completionStats}_\n`);
       session.completionStats = undefined;
-      await Promise.race([statsPromise.catch(() => {}), sleep(500)]);
+      // Wait for stats to be sent before returning
+      await Promise.race([session.updateQueue.catch(() => {}), sleep(1000)]);
     }
+
+    // Final queue drain to ensure loading state stops properly
+    await session.updateQueue.catch(() => {});
 
     return { stopReason: "end_turn" };
   }
@@ -1081,6 +1081,7 @@ export class AutohandAcpAgent implements Agent {
       hasAgentResponse: false,
       stdoutFallbackActive: false,
       stdoutBuffer: "",
+      rawStdoutForStats: "",
       useClientTerminal,
       autohandHome,
       titleGenerated: true, // Don't regenerate title for loaded sessions
@@ -1519,11 +1520,9 @@ export class AutohandAcpAgent implements Agent {
     );
 
     if (!conversationPath) {
-      await debugLog(`[trackConversation] No conversation path found for session ${session.id}`);
       return;
     }
 
-    await debugLog(`[trackConversation] Found conversation path: ${conversationPath}`);
 
     // Disable stdout fallback immediately when we find conversation.jsonl
     // This prevents duplicate messages from stdout racing with conversation.jsonl
@@ -1591,14 +1590,11 @@ export class AutohandAcpAgent implements Agent {
         try {
           message = JSON.parse(trimmed) as SessionMessage;
         } catch {
-          await debugLog(`[readConversation] Failed to parse line: ${trimmed.slice(0, 100)}`);
           continue;
         }
-        await debugLog(`[readConversation] Parsed message role=${message.role}, content length=${message.content?.length ?? 0}`);
         await this.handleSessionMessage(session, message);
       }
-    } catch (e) {
-      await debugLog(`[readConversation] Error reading file: ${e instanceof Error ? e.message : String(e)}`);
+    } catch {
       return;
     } finally {
       if (fileHandle) {
@@ -1608,10 +1604,8 @@ export class AutohandAcpAgent implements Agent {
   }
 
   private async handleSessionMessage(session: SessionState, message: SessionMessage): Promise<void> {
-    await debugLog(`[handleSessionMessage] Processing message role=${message.role}`);
     if (message.role === "assistant") {
       const parsed = message.content ? parseAssistantContent(message.content) : null;
-      await debugLog(`[handleSessionMessage] Parsed: structured=${parsed?.structured}, hasThought=${!!parsed?.thought}, hasResponse=${!!parsed?.response}`);
       const toolCalls = Array.isArray(message.toolCalls)
         ? message.toolCalls
         : parsed?.toolCalls;
@@ -1646,15 +1640,12 @@ export class AutohandAcpAgent implements Agent {
       }
 
       const responseText = parsed ? resolveAssistantResponse(parsed, toolCalls) : null;
-      await debugLog(`[handleSessionMessage] responseText=${responseText ? responseText.slice(0, 100) : "null"}`);
       if (responseText) {
         markStructuredOutput();
         markAgentResponse();
-        await debugLog(`[handleSessionMessage] Calling queueTextUpdate with ${responseText.length} chars`);
         await this.queueTextUpdate(session, responseText + "\n");
         session.history.push({ role: "assistant", content: responseText });
       } else {
-        await debugLog(`[handleSessionMessage] No responseText to send`);
       }
 
       // Handle tool calls
@@ -1948,7 +1939,6 @@ export class AutohandAcpAgent implements Agent {
 
   private queueTextUpdate(session: SessionState, text: string): Promise<void> {
     const chunks = chunkText(text, MAX_UPDATE_CHUNK);
-    void debugLog(`[queueTextUpdate] Queueing ${chunks.length} chunks for ${text.length} chars`);
 
     session.updateQueue = session.updateQueue
       .catch(() => undefined)
@@ -1964,9 +1954,7 @@ export class AutohandAcpAgent implements Agent {
               },
             },
           };
-          void debugLog(`[queueTextUpdate] Sending agent_message_chunk: ${chunk.slice(0, 50)}...`);
           await this.client.sessionUpdate(notification);
-          void debugLog(`[queueTextUpdate] Sent successfully`);
         }
       });
 
@@ -2419,11 +2407,9 @@ async function waitForConversationPath(
 ): Promise<string | null> {
   const sessionsDir = path.join(autohandHome, "sessions");
   const resolvedCwd = path.resolve(cwd);
-  void debugLog(`[waitForConversationPath] sessionsDir=${sessionsDir}, cwd=${resolvedCwd}, snapshot.size=${snapshot.size}`);
 
   for (let attempts = 0; attempts < 40; attempts += 1) {
     if (signal.aborted) {
-      void debugLog(`[waitForConversationPath] Signal aborted at attempt ${attempts}`);
       return null;
     }
 
@@ -2432,13 +2418,11 @@ async function waitForConversationPath(
       .filter((session) => !snapshot.has(session.id) && path.resolve(session.projectPath) === resolvedCwd)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     if (attempts === 0 || attempts % 10 === 0) {
-      void debugLog(`[waitForConversationPath] Attempt ${attempts}: sessions=${sessions.length}, candidates=${candidates.length}`);
     }
     if (candidates.length > 0) {
       for (const candidate of candidates) {
         const result = path.join(sessionsDir, candidate.id, "conversation.jsonl");
         if (existsSync(result)) {
-          void debugLog(`[waitForConversationPath] Found via index: ${result}`);
           return result;
         }
       }
@@ -2473,7 +2457,6 @@ async function waitForConversationPath(
       }
       if (dirCandidates.length > 0) {
         const latest = dirCandidates.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-        void debugLog(`[waitForConversationPath] Found via directory scan: ${latest.conversationPath}`);
         return latest.conversationPath;
       }
     }
@@ -2481,7 +2464,6 @@ async function waitForConversationPath(
     await sleep(200);
   }
 
-  void debugLog(`[waitForConversationPath] Timeout after 40 attempts`);
   return null;
 }
 
