@@ -61,6 +61,69 @@ import {
 import { createPermissionServer, type PermissionServer } from "./permission-server.js";
 import { getTelemetryClient } from "./telemetry.js";
 
+// ============ Feedback Types & Client ============
+
+interface FeedbackResponse {
+  npsScore: number;
+  reason?: string;
+  timestamp: string;
+  sessionId?: string;
+  triggerType: "manual" | "auto_prompt";
+}
+
+interface FeedbackSubmission extends FeedbackResponse {
+  deviceId: string;
+  cliVersion: string;
+  platform: string;
+  osVersion: string;
+  nodeVersion: string;
+  source: "acp_extension";
+}
+
+const FEEDBACK_API_URL = "https://api.autohand.ai/v1/feedback";
+const FEEDBACK_COOLDOWN_HOURS = 48;
+const FEEDBACK_MIN_INTERACTIONS = 5;
+
+// Simple device ID generator (anonymous, not tied to user identity)
+function getDeviceId(): string {
+  const id = `acp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  return id;
+}
+
+async function submitFeedback(feedback: FeedbackResponse): Promise<boolean> {
+  const submission: FeedbackSubmission = {
+    ...feedback,
+    deviceId: getDeviceId(),
+    cliVersion: packageJson.version,
+    platform: process.platform,
+    osVersion: os.release(),
+    nodeVersion: process.version,
+    source: "acp_extension",
+  };
+
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+    const response = await fetch(FEEDBACK_API_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-CLI-Version": packageJson.version,
+        "X-Device-ID": submission.deviceId,
+      },
+      body: JSON.stringify(submission),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+// ============ Constants ============
 
 const DEFAULT_HISTORY_LIMIT = 6;
 const DEFAULT_MAX_HISTORY_CHARS = 8000;
@@ -260,6 +323,10 @@ type SessionState = {
   titleGenerated: boolean;
   parentSessionId?: string; // For forked sessions
   mcpServers: Array<{ name: string; type: string; url?: string; command?: string }>;
+  // Feedback tracking
+  interactionCount: number;
+  lastFeedbackPrompt?: string; // ISO timestamp
+  feedbackPending: boolean; // Waiting for feedback response
 };
 
 export class AutohandAcpAgent implements Agent {
@@ -352,6 +419,8 @@ export class AutohandAcpAgent implements Agent {
       autohandHome: resolveAutohandHome(),
       titleGenerated: false,
       mcpServers,
+      interactionCount: 0,
+      feedbackPending: false,
     });
 
     const response: NewSessionResponse = { sessionId };
@@ -496,6 +565,8 @@ export class AutohandAcpAgent implements Agent {
       title: parentSession.title ? `${parentSession.title} (fork)` : undefined,
       parentSessionId: parentSession.id,
       mcpServers,
+      interactionCount: 0,
+      feedbackPending: false,
     });
 
     const forkedSession = this.sessions.get(newSessionId)!;
@@ -581,6 +652,8 @@ export class AutohandAcpAgent implements Agent {
       titleGenerated: true, // Don't regenerate title for resumed sessions
       title: `Resumed: ${sessionIdToResume.slice(0, 8)}`,
       mcpServers,
+      interactionCount: 0,
+      feedbackPending: false,
     });
 
 
@@ -973,10 +1046,50 @@ export class AutohandAcpAgent implements Agent {
       await Promise.race([session.updateQueue.catch(() => {}), sleep(1000)]);
     }
 
+    // Track interaction and check for auto feedback prompt
+    session.interactionCount++;
+    await this.maybeShowFeedbackPrompt(session);
+
     // Final queue drain to ensure loading state stops properly
     await session.updateQueue.catch(() => {});
 
     return { stopReason: "end_turn" };
+  }
+
+  private async maybeShowFeedbackPrompt(session: SessionState): Promise<void> {
+    // Check if we should show feedback prompt
+    if (session.interactionCount < FEEDBACK_MIN_INTERACTIONS) {
+      return;
+    }
+
+    // Check cooldown (48 hours between prompts)
+    if (session.lastFeedbackPrompt) {
+      const lastPrompt = new Date(session.lastFeedbackPrompt).getTime();
+      const hoursSince = (Date.now() - lastPrompt) / 1000 / 60 / 60;
+      if (hoursSince < FEEDBACK_COOLDOWN_HOURS) {
+        return;
+      }
+    }
+
+    // Only prompt every 5 interactions after minimum, with 30% probability
+    if ((session.interactionCount - FEEDBACK_MIN_INTERACTIONS) % 5 !== 0) {
+      return;
+    }
+
+    if (Math.random() > 0.3) {
+      return;
+    }
+
+    // Show subtle feedback reminder
+    const reminder = [
+      "",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "  💬 Quick feedback? Type /feedback",
+      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "",
+    ];
+    this.queueTextUpdate(session, reminder.join("\n"));
+    session.lastFeedbackPrompt = new Date().toISOString();
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -1087,6 +1200,8 @@ export class AutohandAcpAgent implements Agent {
       titleGenerated: true, // Don't regenerate title for loaded sessions
       title: `Loaded: ${loadSessionId.slice(0, 8)}`,
       mcpServers,
+      interactionCount: 0,
+      feedbackPending: false,
     });
 
     const session = this.sessions.get(loadSessionId)!;
@@ -1333,9 +1448,78 @@ export class AutohandAcpAgent implements Agent {
       return { handled: true };
     }
 
+    // Handle /feedback - send feedback to Autohand
+    if (command === "feedback") {
+      // Check if user provided a rating directly: /feedback 5 or /feedback 4 Great tool!
+      if (args.length > 0) {
+        const rating = parseInt(args[0], 10);
+        if (rating >= 1 && rating <= 5) {
+          const comment = args.slice(1).join(" ") || undefined;
+          const success = await this.submitUserFeedback(session, rating, comment, "manual");
+          if (success) {
+            const emoji = rating >= 4 ? "🎉" : rating >= 3 ? "👍" : "📝";
+            await this.queueTextUpdate(
+              session,
+              `${emoji} Thank you for your feedback! Rating: ${"★".repeat(rating)}${"☆".repeat(5 - rating)}\n`,
+            );
+          } else {
+            await this.queueTextUpdate(
+              session,
+              "Failed to submit feedback. Please try again later.\n",
+            );
+          }
+          return { handled: true };
+        }
+      }
+
+      // Show feedback prompt
+      const feedbackPrompt = [
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "  📊 Quick Feedback",
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "How would you rate your experience with Autohand?",
+        "",
+        "  ★★★★★  5 - Excellent",
+        "  ★★★★☆  4 - Good",
+        "  ★★★☆☆  3 - Okay",
+        "  ★★☆☆☆  2 - Poor",
+        "  ★☆☆☆☆  1 - Very Poor",
+        "",
+        "Reply with: /feedback <1-5> [optional comment]",
+        "",
+        "Examples:",
+        "  /feedback 5",
+        "  /feedback 4 Love the tool!",
+        "  /feedback 3 Could use better error messages",
+        "",
+      ];
+      await this.queueTextUpdate(session, feedbackPrompt.join("\n") + "\n");
+      return { handled: true };
+    }
+
     // Commands that should be passed to Autohand CLI
     // Return handled: false to continue with regular prompt flow
     return { handled: false };
+  }
+
+  private async submitUserFeedback(
+    session: SessionState,
+    rating: number,
+    comment: string | undefined,
+    triggerType: "manual" | "auto_prompt",
+  ): Promise<boolean> {
+    const feedback: FeedbackResponse = {
+      npsScore: rating,
+      reason: comment,
+      timestamp: new Date().toISOString(),
+      sessionId: session.id,
+      triggerType,
+    };
+
+    session.lastFeedbackPrompt = new Date().toISOString();
+    return submitFeedback(feedback);
   }
 
   private generateHelpText(session: SessionState): string {
