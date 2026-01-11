@@ -257,6 +257,7 @@ type SessionState = {
   conversationOffset: number;
   conversationRemainder: string;
   hasStructuredOutput: boolean;
+  hasAgentResponse: boolean;
   stdoutFallbackActive: boolean;
   stdoutBuffer: string;
   stdoutFallbackTimer?: ReturnType<typeof setTimeout>;
@@ -351,6 +352,7 @@ export class AutohandAcpAgent implements Agent {
       conversationOffset: 0,
       conversationRemainder: "",
       hasStructuredOutput: false,
+      hasAgentResponse: false,
       stdoutFallbackActive: false,
       stdoutBuffer: "",
       useClientTerminal,
@@ -491,6 +493,7 @@ export class AutohandAcpAgent implements Agent {
       conversationOffset: 0,
       conversationRemainder: "",
       hasStructuredOutput: false,
+      hasAgentResponse: false,
       stdoutFallbackActive: false,
       stdoutBuffer: "",
       useClientTerminal: parentSession.useClientTerminal,
@@ -575,6 +578,7 @@ export class AutohandAcpAgent implements Agent {
       conversationOffset: 0,
       conversationRemainder: "",
       hasStructuredOutput: false,
+      hasAgentResponse: false,
       stdoutFallbackActive: false,
       stdoutBuffer: "",
       useClientTerminal,
@@ -696,6 +700,7 @@ export class AutohandAcpAgent implements Agent {
     session.history.push({ role: "user", content: userText });
     session.cancelled = false;
     session.hasStructuredOutput = false;
+    session.hasAgentResponse = false;
     session.stdoutFallbackActive = false;
     session.stdoutBuffer = "";
     if (session.stdoutFallbackTimer) {
@@ -815,7 +820,7 @@ export class AutohandAcpAgent implements Agent {
     const STDOUT_FALLBACK_DELAY_MS = 800;
 
     session.stdoutFallbackTimer = setTimeout(() => {
-      if (!session.hasStructuredOutput) {
+      if (!session.hasAgentResponse) {
         session.stdoutFallbackActive = true;
         if (session.stdoutBuffer) {
           void this.queueTextUpdate(session, session.stdoutBuffer);
@@ -848,7 +853,7 @@ export class AutohandAcpAgent implements Agent {
         return;
       }
 
-      if (session.hasStructuredOutput) {
+      if (session.hasAgentResponse) {
         return;
       }
 
@@ -896,7 +901,8 @@ export class AutohandAcpAgent implements Agent {
       clearTimeout(session.stdoutFallbackTimer);
       session.stdoutFallbackTimer = undefined;
     }
-    if (!session.hasStructuredOutput && session.stdoutBuffer) {
+    if (!session.hasAgentResponse && session.stdoutBuffer) {
+      void debugLog(`[stdoutFallback] Flushing buffered stdout (${session.stdoutBuffer.length} chars)`);
       await this.queueTextUpdate(session, session.stdoutBuffer);
       session.stdoutBuffer = "";
     }
@@ -1058,6 +1064,7 @@ export class AutohandAcpAgent implements Agent {
       conversationOffset: 0,
       conversationRemainder: "",
       hasStructuredOutput: false,
+      hasAgentResponse: false,
       stdoutFallbackActive: false,
       stdoutBuffer: "",
       useClientTerminal,
@@ -1593,6 +1600,17 @@ export class AutohandAcpAgent implements Agent {
           clearTimeout(session.stdoutFallbackTimer);
           session.stdoutFallbackTimer = undefined;
         }
+      };
+      const markAgentResponse = () => {
+        if (session.hasAgentResponse) {
+          return;
+        }
+        session.hasAgentResponse = true;
+        session.stdoutFallbackActive = false;
+        if (session.stdoutFallbackTimer) {
+          clearTimeout(session.stdoutFallbackTimer);
+          session.stdoutFallbackTimer = undefined;
+        }
         session.stdoutBuffer = "";
       };
 
@@ -1606,6 +1624,7 @@ export class AutohandAcpAgent implements Agent {
       await debugLog(`[handleSessionMessage] responseText=${responseText ? responseText.slice(0, 100) : "null"}`);
       if (responseText) {
         markStructuredOutput();
+        markAgentResponse();
         await debugLog(`[handleSessionMessage] Calling queueTextUpdate with ${responseText.length} chars`);
         await this.queueTextUpdate(session, responseText + "\n");
         session.history.push({ role: "assistant", content: responseText });
