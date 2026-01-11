@@ -364,6 +364,9 @@ export class AutohandAcpAgent implements Agent {
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
     this.clientCapabilities = params.clientCapabilities;
 
+    // Debug: log client capabilities
+    console.error("[ACP DEBUG] Client capabilities:", JSON.stringify(params.clientCapabilities, null, 2));
+
     // Capture client info (e.g., "zed", "Zed Editor")
     if (params.clientInfo) {
       this.clientInfo = {
@@ -392,6 +395,7 @@ export class AutohandAcpAgent implements Agent {
 
     // Check authentication status
     const isAuthenticated = await checkAuthStatus();
+    console.error("[ACP DEBUG] isAuthenticated:", isAuthenticated);
 
     // Build auth methods - only show login if not authenticated
     const authMethods: AuthMethod[] = [];
@@ -404,7 +408,7 @@ export class AutohandAcpAgent implements Agent {
       });
     }
 
-    return {
+    const response = {
       protocolVersion: params.protocolVersion ?? 1,
       agentCapabilities,
       agentInfo: {
@@ -414,10 +418,16 @@ export class AutohandAcpAgent implements Agent {
       },
       authMethods: authMethods.length > 0 ? authMethods : undefined,
     };
+
+    console.error("[ACP DEBUG] initialize response authMethods:", JSON.stringify(response.authMethods));
+
+    return response;
   }
 
   async authenticate(params: AuthenticateRequest): Promise<AuthenticateResponse> {
     const methodId = params?.methodId ?? "login";
+
+    console.error("[ACP DEBUG] authenticate called with methodId:", methodId);
 
     // If using a stub, authentication is not needed
     if (process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD)) {
@@ -435,61 +445,28 @@ export class AutohandAcpAgent implements Agent {
       });
     }
 
-    // Create a temporary session for the login terminal
-    const authSessionId = `auth-${randomUUID()}`;
     const cwd = process.cwd();
-
-    // Register this session with Zed by storing it
-    this.sessions.set(authSessionId, {
-      id: authSessionId,
-      cwd,
-      history: [],
-      cancelled: false,
-      updateQueue: Promise.resolve(),
-      promptQueue: Promise.resolve({ stopReason: "end_turn" }),
-      availableModes: DEFAULT_MODES,
-      modeId: "default",
-      availableModels: DEFAULT_MODELS,
-      modelId: DEFAULT_MODELS[0]?.modelId ?? "",
-      availableCommands: DEFAULT_COMMANDS,
-      configOptions: [],
-      toolCalls: new Map(),
-      toolCallOutputs: new Map(),
-      streamingToolCalls: new Set(),
-      terminalToolCalls: new Set(),
-      conversationOffset: 0,
-      conversationRemainder: "",
-      hasStructuredOutput: false,
-      hasAgentResponse: false,
-      stdoutFallbackActive: false,
-      stdoutBuffer: "",
-      rawStdoutForStats: "",
-      useClientTerminal: false,
-      autohandHome: resolveAutohandHome(),
-      titleGenerated: false,
-      mcpServers: [],
-      interactionCount: 0,
-      feedbackPending: false,
-      feedbackShownThisSession: false,
-    });
 
     try {
       const { command, baseArgs } = findAutohandBinary();
 
+      console.error("[ACP DEBUG] Creating auth terminal with command:", command, "args:", [...baseArgs, "login"]);
+
+      // For authentication, use empty sessionId - Zed should handle auth terminals specially
       const terminal = await this.client.createTerminal({
-        sessionId: authSessionId,
+        sessionId: "" as any, // Auth terminals don't have a session yet
         command,
         args: [...baseArgs, "login"],
-        title: "Autohand Login",
         cwd,
       });
+
+      console.error("[ACP DEBUG] Terminal created:", terminal.id);
 
       // Wait for login to complete
       const result = await terminal.waitForExit();
       await terminal.release();
 
-      // Clean up temp session
-      this.sessions.delete(authSessionId);
+      console.error("[ACP DEBUG] Terminal exited with code:", result.exitCode);
 
       if (result.exitCode !== 0) {
         throw RequestError.invalidRequest({
@@ -499,8 +476,7 @@ export class AutohandAcpAgent implements Agent {
 
       return {};
     } catch (error: unknown) {
-      // Clean up on error
-      this.sessions.delete(authSessionId);
+      console.error("[ACP DEBUG] authenticate error:", error);
 
       if (error instanceof Error && "code" in error) {
         throw error;
@@ -881,36 +857,38 @@ export class AutohandAcpAgent implements Agent {
     // Skip auth check if using a stub (for testing)
     const isStub = process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
     const isAuthenticated = isStub || await checkAuthStatus();
-    
+
+    // Debug: log auth check results
+    console.error("[ACP DEBUG] Auth check - isStub:", isStub, "isAuthenticated:", isAuthenticated, "terminal capability:", this.clientCapabilities?.terminal);
+
     if (!isAuthenticated && this.clientCapabilities?.terminal) {
       const { command, baseArgs } = findAutohandBinary();
       const fullArgs = [...baseArgs, "login"];
       try {
-        await this.queueTextUpdate(session, `🔐 Authentication required. Opening login...\nCommand: ${command} ${fullArgs.join(" ")}\n`);
-
+        // Create terminal in Zed's terminal panel (like Auggie does)
         const terminal = await this.client.createTerminal({
           sessionId: session.id,
           command,
           args: fullArgs,
-          title: "Autohand Login",
           cwd: session.cwd,
         });
 
-        await this.queueTextUpdate(session, "Terminal created, waiting for login...\n");
+        await this.queueTextUpdate(session, "🔐 **Authentication required**\n\nLogin terminal opened. Complete the authentication in your browser.\n");
 
         // Wait for login to complete
-        const result = await terminal.waitForExit();
+        const exitStatus = await terminal.waitForExit();
         await terminal.release();
 
-        if (result.exitCode !== 0) {
-          await this.queueTextUpdate(session, `❌ Login cancelled or failed (exit code: ${result.exitCode}). Please try again.\n`);
-          return { stopReason: "end_turn" };
+        if (exitStatus.exitCode === 0) {
+          await this.queueTextUpdate(session, "\n✅ **Login successful!** Send your message again.\n");
+        } else {
+          await this.queueTextUpdate(session, "\n❌ **Login cancelled or failed.** Please try again.\n");
         }
 
-        await this.queueTextUpdate(session, "✅ Login successful! Processing your request...\n\n");
+        return { stopReason: "end_turn" };
       } catch (error: unknown) {
         const errMsg = error instanceof Error ? error.message : String(error);
-        await this.queueTextUpdate(session, `❌ Could not open login terminal: ${errMsg}\nPlease run \`autohand login\` in your terminal.\n`);
+        await this.queueTextUpdate(session, `❌ Could not open login terminal: ${errMsg}\n\nPlease run \`autohand login\` in your terminal.\n`);
         return { stopReason: "end_turn" };
       }
     } else if (!isAuthenticated) {
