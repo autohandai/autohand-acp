@@ -1503,6 +1503,10 @@ export class AutohandAcpAgent implements Agent {
     }
 
     await debugLog(`[trackConversation] Found conversation path: ${conversationPath}`);
+    if (session.conversationPath !== conversationPath) {
+      session.conversationOffset = 0;
+      session.conversationRemainder = "";
+    }
     session.conversationPath = conversationPath;
 
     while (!signal.aborted) {
@@ -2377,26 +2381,53 @@ async function waitForConversationPath(
     }
 
     const sessions = await readSessionIndex(autohandHome);
-    const candidates = sessions.filter(
-      (session) => !snapshot.has(session.id) && session.projectPath === resolvedCwd,
-    );
+    const candidates = sessions
+      .filter((session) => !snapshot.has(session.id) && path.resolve(session.projectPath) === resolvedCwd)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     if (attempts === 0 || attempts % 10 === 0) {
       void debugLog(`[waitForConversationPath] Attempt ${attempts}: sessions=${sessions.length}, candidates=${candidates.length}`);
     }
     if (candidates.length > 0) {
-      const latest = candidates.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-      const result = path.join(sessionsDir, latest.id, "conversation.jsonl");
-      void debugLog(`[waitForConversationPath] Found via index: ${result}`);
-      return result;
+      for (const candidate of candidates) {
+        const result = path.join(sessionsDir, candidate.id, "conversation.jsonl");
+        if (existsSync(result)) {
+          void debugLog(`[waitForConversationPath] Found via index: ${result}`);
+          return result;
+        }
+      }
     }
 
     if (existsSync(sessionsDir)) {
       const entries = await fs.readdir(sessionsDir, { withFileTypes: true });
-      const dir = entries.find((entry) => entry.isDirectory() && !snapshot.has(entry.name));
-      if (dir) {
-        const result = path.join(sessionsDir, dir.name, "conversation.jsonl");
-        void debugLog(`[waitForConversationPath] Found via directory scan: ${result}`);
-        return result;
+      const dirCandidates: Array<{ createdAt: string; conversationPath: string }> = [];
+      for (const entry of entries) {
+        if (!entry.isDirectory() || snapshot.has(entry.name)) {
+          continue;
+        }
+        const metadataPath = path.join(sessionsDir, entry.name, "metadata.json");
+        let metadata: { projectPath?: string; createdAt?: string } | null = null;
+        try {
+          const raw = await fs.readFile(metadataPath, "utf8");
+          metadata = JSON.parse(raw) as { projectPath?: string; createdAt?: string };
+        } catch {
+          continue;
+        }
+        if (!metadata?.projectPath || path.resolve(metadata.projectPath) !== resolvedCwd) {
+          continue;
+        }
+        const conversationPath = path.join(sessionsDir, entry.name, "conversation.jsonl");
+        if (!existsSync(conversationPath)) {
+          continue;
+        }
+        dirCandidates.push({
+          createdAt: metadata.createdAt ?? "",
+          conversationPath,
+        });
+      }
+      if (dirCandidates.length > 0) {
+        const latest = dirCandidates.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+        void debugLog(`[waitForConversationPath] Found via directory scan: ${latest.conversationPath}`);
+        return latest.conversationPath;
       }
     }
 
