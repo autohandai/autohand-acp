@@ -6,6 +6,17 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 EXT_ID="autohand-acp"
 AGENT_NAME="${AUTOHAND_ZED_AGENT_NAME:-Autohand CLI (Local)}"
+AUTOHAND_CMD_OVERRIDE="${AUTOHAND_ZED_CMD:-}"
+
+if [ -z "$AUTOHAND_CMD_OVERRIDE" ]; then
+  if command -v autohand >/dev/null 2>&1; then
+    AUTOHAND_CMD_OVERRIDE="$(command -v autohand)"
+  elif [ -f "$HOME/Documents/autohand/cli-3/dist/index.js" ]; then
+    AUTOHAND_CMD_OVERRIDE="node $HOME/Documents/autohand/cli-3/dist/index.js"
+  elif [ -f "$HOME/documents/autohand/cli-3/dist/index.js" ]; then
+    AUTOHAND_CMD_OVERRIDE="node $HOME/documents/autohand/cli-3/dist/index.js"
+  fi
+fi
 
 NO_BUILD=0
 NO_SETTINGS=0
@@ -78,6 +89,7 @@ if [ "$NO_SETTINGS" -eq 0 ]; then
   echo "🧩 Ensuring Zed agent_servers entry..."
   AUTOHAND_ACP_PATH="$ROOT_DIR/dist/index.js" \
   AGENT_NAME="$AGENT_NAME" \
+  AUTOHAND_CMD="$AUTOHAND_CMD_OVERRIDE" \
   node <<'NODE'
 const fs = require("fs");
 const path = require("path");
@@ -89,6 +101,7 @@ const settingsPath = process.env.ZED_SETTINGS_PATH || path.join(
 );
 const agentName = process.env.AGENT_NAME || "Autohand CLI (Local)";
 const agentPath = process.env.AUTOHAND_ACP_PATH;
+const autohandCmd = process.env.AUTOHAND_CMD;
 
 function stripJsonComments(input) {
   let out = "";
@@ -225,12 +238,16 @@ if (fs.existsSync(settingsPath)) {
 }
 
 settings.agent_servers = settings.agent_servers || {};
+const env = {
+  AUTOHAND_PERMISSION_MODE: "external"
+};
+if (autohandCmd) {
+  env.AUTOHAND_CMD = autohandCmd;
+}
 settings.agent_servers[agentName] = {
   command: "node",
   args: [agentPath],
-  env: {
-    AUTOHAND_PERMISSION_MODE: "external"
-  }
+  env
 };
 
 fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + "\n", "utf8");

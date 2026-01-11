@@ -731,6 +731,7 @@ export class AutohandAcpAgent implements Agent {
       autohandHome: session.autohandHome,
       permissionCallbackUrl,
     });
+    void debugLog(`[runAutohandProcess] command=${command} args=${args.join(" ")}`);
 
     if (configPath && !existsSync(configPath)) {
       await this.queueTextUpdate(
@@ -840,10 +841,15 @@ export class AutohandAcpAgent implements Agent {
         return;
       }
 
+      // Filter out CLI status messages and internal output
       if (
         text.match(/\[hook:[^\]]+\]/) ||
-        text.match(/^Turn complete:/i) ||
-        text.match(/^Completed in \d+/i)
+        text.match(/Turn complete:/i) ||
+        text.match(/Completed in \d+/i) ||
+        text.match(/^Thinking:/i) ||
+        text.match(/^→/i) ||
+        text.match(/^Step \d+:/i) ||
+        text.match(/tokens used/i)
       ) {
         return;
       }
@@ -1510,6 +1516,17 @@ export class AutohandAcpAgent implements Agent {
     }
 
     await debugLog(`[trackConversation] Found conversation path: ${conversationPath}`);
+
+    // Disable stdout fallback immediately when we find conversation.jsonl
+    // This prevents duplicate messages from stdout racing with conversation.jsonl
+    session.hasStructuredOutput = true;
+    session.stdoutFallbackActive = false;
+    if (session.stdoutFallbackTimer) {
+      clearTimeout(session.stdoutFallbackTimer);
+      session.stdoutFallbackTimer = undefined;
+    }
+    session.stdoutBuffer = "";
+
     if (session.conversationPath !== conversationPath) {
       session.conversationOffset = 0;
       session.conversationRemainder = "";
@@ -2202,8 +2219,11 @@ function buildAutohandCommand(options: {
   env: NodeJS.ProcessEnv;
   configPath: string | null;
 } {
-  const command = process.env.AUTOHAND_CMD ?? "autohand";
-  const args: string[] = ["--prompt", options.instruction, "--path", options.cwd];
+  const rawCommand = process.env.AUTOHAND_CMD;
+  const commandParts = rawCommand ? parseEnvArgs(rawCommand) : [];
+  const command = commandParts[0] || rawCommand || "autohand";
+  const commandArgs = commandParts.slice(1);
+  const args: string[] = [...commandArgs, "--prompt", options.instruction, "--path", options.cwd];
 
   const configPath = process.env.AUTOHAND_CONFIG ?? path.join(os.homedir(), ".autohand", "config.json");
   args.push("--config", configPath);
