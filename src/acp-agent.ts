@@ -61,16 +61,12 @@ import {
 import { createPermissionServer, type PermissionServer } from "./permission-server.js";
 import { getTelemetryClient } from "./telemetry.js";
 
-const DEBUG_LOG_FILE = "/tmp/autohand-acp-debug.log";
-
-async function debugLog(message: string): Promise<void> {
-  const timestamp = new Date().toISOString();
-  const line = `[${timestamp}] ${message}\n`;
-  await fs.appendFile(DEBUG_LOG_FILE, line).catch(() => {});
+// Debug logging - disabled for production
+function debugLog(_message: string): void {
+  // No-op in production. Enable by uncommenting:
+  // const DEBUG_LOG_FILE = "/tmp/autohand-acp-debug.log";
+  // void fs.appendFile(DEBUG_LOG_FILE, `[${new Date().toISOString()}] ${_message}\n`).catch(() => {});
 }
-
-// Log startup immediately when module loads
-void fs.appendFile(DEBUG_LOG_FILE, `[${new Date().toISOString()}] === ACP AGENT MODULE LOADED ===\n`).catch(() => {});
 
 const DEFAULT_HISTORY_LIMIT = 6;
 const DEFAULT_MAX_HISTORY_CHARS = 8000;
@@ -261,6 +257,7 @@ type SessionState = {
   stdoutFallbackActive: boolean;
   stdoutBuffer: string;
   stdoutFallbackTimer?: ReturnType<typeof setTimeout>;
+  completionStats?: string;
   useClientTerminal: boolean;
   autohandHome: string;
   permissionServer?: PermissionServer;
@@ -841,15 +838,22 @@ export class AutohandAcpAgent implements Agent {
         return;
       }
 
+      // Capture completion stats (time & tokens) for display
+      const statsMatch = text.match(/Completed in ([^·]+)·?\s*([^·\n]*tokens[^\n]*)?/i);
+      if (statsMatch) {
+        const time = statsMatch[1]?.trim() || "";
+        const tokens = statsMatch[2]?.trim() || "";
+        session.completionStats = tokens ? `${time} · ${tokens}` : time;
+        return;
+      }
+
       // Filter out CLI status messages and internal output
       if (
         text.match(/\[hook:[^\]]+\]/) ||
         text.match(/Turn complete:/i) ||
-        text.match(/Completed in \d+/i) ||
         text.match(/^Thinking:/i) ||
         text.match(/^→/i) ||
-        text.match(/^Step \d+:/i) ||
-        text.match(/tokens used/i)
+        text.match(/^Step \d+:/i)
       ) {
         return;
       }
@@ -961,13 +965,17 @@ export class AutohandAcpAgent implements Agent {
       session.permissionServer = undefined;
     }
 
-    void debugLog(`Draining update queue...`);
-
     // Ensure all pending notifications are sent before returning
     // Use timeout to prevent hanging
     await Promise.race([session.updateQueue.catch(() => {}), sleep(2000)]);
 
-    void debugLog(`About to return end_turn for session ${session.id}`);
+    // Display completion stats if available (after draining main queue)
+    if (session.completionStats) {
+      const statsPromise = this.queueTextUpdate(session, `\n_${session.completionStats}_\n`);
+      session.completionStats = undefined;
+      await Promise.race([statsPromise.catch(() => {}), sleep(500)]);
+    }
+
     return { stopReason: "end_turn" };
   }
 
