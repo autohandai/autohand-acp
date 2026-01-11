@@ -69,6 +69,9 @@ async function debugLog(message: string): Promise<void> {
   await fs.appendFile(DEBUG_LOG_FILE, line).catch(() => {});
 }
 
+// Log startup immediately when module loads
+void fs.appendFile(DEBUG_LOG_FILE, `[${new Date().toISOString()}] === ACP AGENT MODULE LOADED ===\n`).catch(() => {});
+
 const DEFAULT_HISTORY_LIMIT = 6;
 const DEFAULT_MAX_HISTORY_CHARS = 8000;
 const DEFAULT_PERMISSION_MODE = "auto";
@@ -253,6 +256,10 @@ type SessionState = {
   conversationPath?: string;
   conversationOffset: number;
   conversationRemainder: string;
+  hasStructuredOutput: boolean;
+  stdoutFallbackActive: boolean;
+  stdoutBuffer: string;
+  stdoutFallbackTimer?: ReturnType<typeof setTimeout>;
   useClientTerminal: boolean;
   autohandHome: string;
   permissionServer?: PermissionServer;
@@ -343,6 +350,9 @@ export class AutohandAcpAgent implements Agent {
       terminalToolCalls: new Set(),
       conversationOffset: 0,
       conversationRemainder: "",
+      hasStructuredOutput: false,
+      stdoutFallbackActive: false,
+      stdoutBuffer: "",
       useClientTerminal,
       autohandHome: resolveAutohandHome(),
       titleGenerated: false,
@@ -480,6 +490,9 @@ export class AutohandAcpAgent implements Agent {
       terminalToolCalls: new Set(),
       conversationOffset: 0,
       conversationRemainder: "",
+      hasStructuredOutput: false,
+      stdoutFallbackActive: false,
+      stdoutBuffer: "",
       useClientTerminal: parentSession.useClientTerminal,
       autohandHome: parentSession.autohandHome,
       titleGenerated: false,
@@ -561,6 +574,9 @@ export class AutohandAcpAgent implements Agent {
       conversationPath,
       conversationOffset: 0,
       conversationRemainder: "",
+      hasStructuredOutput: false,
+      stdoutFallbackActive: false,
+      stdoutBuffer: "",
       useClientTerminal,
       autohandHome,
       titleGenerated: true, // Don't regenerate title for resumed sessions
@@ -568,7 +584,6 @@ export class AutohandAcpAgent implements Agent {
       mcpServers,
     });
 
-    const session = this.sessions.get(sessionIdToResume)!;
 
     // Note: session_info_update is not a valid ACP notification type in Zed
     // The title is set on the session object but we can't notify Zed about it
@@ -680,6 +695,13 @@ export class AutohandAcpAgent implements Agent {
 
     session.history.push({ role: "user", content: userText });
     session.cancelled = false;
+    session.hasStructuredOutput = false;
+    session.stdoutFallbackActive = false;
+    session.stdoutBuffer = "";
+    if (session.stdoutFallbackTimer) {
+      clearTimeout(session.stdoutFallbackTimer);
+      session.stdoutFallbackTimer = undefined;
+    }
 
     // Start permission server if mode is external
     const permissionMode = (process.env.AUTOHAND_PERMISSION_MODE ?? DEFAULT_PERMISSION_MODE).toLowerCase();
@@ -713,8 +735,10 @@ export class AutohandAcpAgent implements Agent {
     }
 
     const tailAbort = new AbortController();
+    await debugLog(`[runAutohandProcess] Starting trackConversation, sessionsSnapshot.size=${sessionsSnapshot.size}`);
     const tailPromise = this.trackConversation(session, sessionsSnapshot, tailAbort.signal);
 
+    await debugLog(`[runAutohandProcess] useClientTerminal=${session.useClientTerminal}, hasTerminalCap=${!!this.clientCapabilities?.terminal}`);
     if (session.useClientTerminal && this.clientCapabilities?.terminal) {
       const toolCallId = randomUUID();
       const terminal = await this.client.createTerminal({
@@ -788,16 +812,52 @@ export class AutohandAcpAgent implements Agent {
 
     session.activeProcess = child;
 
+    const STDOUT_FALLBACK_DELAY_MS = 800;
+
+    session.stdoutFallbackTimer = setTimeout(() => {
+      if (!session.hasStructuredOutput) {
+        session.stdoutFallbackActive = true;
+        if (session.stdoutBuffer) {
+          void this.queueTextUpdate(session, session.stdoutBuffer);
+          session.stdoutBuffer = "";
+        }
+      }
+    }, STDOUT_FALLBACK_DELAY_MS);
+
     // Structured events (tool calls, thoughts, responses) come from conversation.jsonl
-    // Stdout is used only for real-time progress during tool execution
-    // We filter out internal messages and avoid duplicating agent content
+    // If conversation output doesn't show up quickly, fall back to stdout.
     let stderrOutput = "";
     const MAX_STDERR = 8000;
 
-    const onStdout = (_chunk: Buffer) => {
-      // Stdout is intentionally not processed for agent messages
-      // All structured content (thought, finalResponse) comes from conversation.jsonl
-      // This prevents duplicate messages and ensures proper thought/response separation
+    const onStdout = (chunk: Buffer) => {
+      let text = stripAnsi(chunk.toString("utf8"));
+      if (!text) {
+        return;
+      }
+
+      if (
+        text.match(/\[hook:[^\]]+\]/) ||
+        text.match(/^Turn complete:/i) ||
+        text.match(/^Completed in \d+/i)
+      ) {
+        return;
+      }
+
+      text = text.replace(/<\/?thinking>/gi, "").replace(/<\/?reasoning>/gi, "");
+      if (!text.trim()) {
+        return;
+      }
+
+      if (session.hasStructuredOutput) {
+        return;
+      }
+
+      if (session.stdoutFallbackActive) {
+        void this.queueTextUpdate(session, text);
+        return;
+      }
+
+      session.stdoutBuffer += text;
     };
 
     const onStderr = (chunk: Buffer) => {
@@ -832,6 +892,14 @@ export class AutohandAcpAgent implements Agent {
     child.stderr.off("data", onStderr);
     child.stdout.destroy();
     child.stderr.destroy();
+    if (session.stdoutFallbackTimer) {
+      clearTimeout(session.stdoutFallbackTimer);
+      session.stdoutFallbackTimer = undefined;
+    }
+    if (!session.hasStructuredOutput && session.stdoutBuffer) {
+      await this.queueTextUpdate(session, session.stdoutBuffer);
+      session.stdoutBuffer = "";
+    }
 
     session.activeProcess = undefined;
     tailAbort.abort();
@@ -989,6 +1057,9 @@ export class AutohandAcpAgent implements Agent {
       terminalToolCalls: new Set(),
       conversationOffset: 0,
       conversationRemainder: "",
+      hasStructuredOutput: false,
+      stdoutFallbackActive: false,
+      stdoutBuffer: "",
       useClientTerminal,
       autohandHome,
       titleGenerated: true, // Don't regenerate title for loaded sessions
@@ -1427,9 +1498,11 @@ export class AutohandAcpAgent implements Agent {
     );
 
     if (!conversationPath) {
+      await debugLog(`[trackConversation] No conversation path found for session ${session.id}`);
       return;
     }
 
+    await debugLog(`[trackConversation] Found conversation path: ${conversationPath}`);
     session.conversationPath = conversationPath;
 
     while (!signal.aborted) {
@@ -1482,11 +1555,14 @@ export class AutohandAcpAgent implements Agent {
         try {
           message = JSON.parse(trimmed) as SessionMessage;
         } catch {
+          await debugLog(`[readConversation] Failed to parse line: ${trimmed.slice(0, 100)}`);
           continue;
         }
+        await debugLog(`[readConversation] Parsed message role=${message.role}, content length=${message.content?.length ?? 0}`);
         await this.handleSessionMessage(session, message);
       }
-    } catch {
+    } catch (e) {
+      await debugLog(`[readConversation] Error reading file: ${e instanceof Error ? e.message : String(e)}`);
       return;
     } finally {
       if (fileHandle) {
@@ -1496,20 +1572,41 @@ export class AutohandAcpAgent implements Agent {
   }
 
   private async handleSessionMessage(session: SessionState, message: SessionMessage): Promise<void> {
+    await debugLog(`[handleSessionMessage] Processing message role=${message.role}`);
     if (message.role === "assistant") {
       const parsed = message.content ? parseAssistantContent(message.content) : null;
+      await debugLog(`[handleSessionMessage] Parsed: structured=${parsed?.structured}, hasThought=${!!parsed?.thought}, hasResponse=${!!parsed?.response}`);
       const toolCalls = Array.isArray(message.toolCalls)
         ? message.toolCalls
         : parsed?.toolCalls;
+      const markStructuredOutput = () => {
+        if (session.hasStructuredOutput) {
+          return;
+        }
+        session.hasStructuredOutput = true;
+        session.stdoutFallbackActive = false;
+        if (session.stdoutFallbackTimer) {
+          clearTimeout(session.stdoutFallbackTimer);
+          session.stdoutFallbackTimer = undefined;
+        }
+        session.stdoutBuffer = "";
+      };
 
-      if (parsed?.thought && hasText(parsed.thought)) {
+      const usesThoughtAsResponse = shouldUseThoughtAsResponse(parsed, toolCalls);
+      if (!usesThoughtAsResponse && parsed?.thought && hasText(parsed.thought)) {
+        markStructuredOutput();
         await this.queueThoughtUpdate(session, parsed.thought);
       }
 
       const responseText = parsed ? resolveAssistantResponse(parsed, toolCalls) : null;
+      await debugLog(`[handleSessionMessage] responseText=${responseText ? responseText.slice(0, 100) : "null"}`);
       if (responseText) {
+        markStructuredOutput();
+        await debugLog(`[handleSessionMessage] Calling queueTextUpdate with ${responseText.length} chars`);
         await this.queueTextUpdate(session, responseText + "\n");
         session.history.push({ role: "assistant", content: responseText });
+      } else {
+        await debugLog(`[handleSessionMessage] No responseText to send`);
       }
 
       // Handle tool calls
@@ -1803,6 +1900,7 @@ export class AutohandAcpAgent implements Agent {
 
   private queueTextUpdate(session: SessionState, text: string): Promise<void> {
     const chunks = chunkText(text, MAX_UPDATE_CHUNK);
+    void debugLog(`[queueTextUpdate] Queueing ${chunks.length} chunks for ${text.length} chars`);
 
     session.updateQueue = session.updateQueue
       .catch(() => undefined)
@@ -1818,7 +1916,9 @@ export class AutohandAcpAgent implements Agent {
               },
             },
           };
+          void debugLog(`[queueTextUpdate] Sending agent_message_chunk: ${chunk.slice(0, 50)}...`);
           await this.client.sessionUpdate(notification);
+          void debugLog(`[queueTextUpdate] Sent successfully`);
         }
       });
 
@@ -1968,6 +2068,20 @@ function resolveAssistantResponse(
   }
 
   return null;
+}
+
+function shouldUseThoughtAsResponse(
+  parsed: ParsedAssistantContent | null,
+  toolCalls?: ToolCallRecord[] | null,
+): boolean {
+  if (!parsed) {
+    return false;
+  }
+  if (hasText(parsed.response)) {
+    return false;
+  }
+  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+  return !hasToolCalls && hasText(parsed.thought);
 }
 
 function promptToText(prompt: ContentBlock[]): string {
@@ -2254,9 +2368,11 @@ async function waitForConversationPath(
 ): Promise<string | null> {
   const sessionsDir = path.join(autohandHome, "sessions");
   const resolvedCwd = path.resolve(cwd);
+  void debugLog(`[waitForConversationPath] sessionsDir=${sessionsDir}, cwd=${resolvedCwd}, snapshot.size=${snapshot.size}`);
 
   for (let attempts = 0; attempts < 40; attempts += 1) {
     if (signal.aborted) {
+      void debugLog(`[waitForConversationPath] Signal aborted at attempt ${attempts}`);
       return null;
     }
 
@@ -2264,22 +2380,30 @@ async function waitForConversationPath(
     const candidates = sessions.filter(
       (session) => !snapshot.has(session.id) && session.projectPath === resolvedCwd,
     );
+    if (attempts === 0 || attempts % 10 === 0) {
+      void debugLog(`[waitForConversationPath] Attempt ${attempts}: sessions=${sessions.length}, candidates=${candidates.length}`);
+    }
     if (candidates.length > 0) {
       const latest = candidates.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
-      return path.join(sessionsDir, latest.id, "conversation.jsonl");
+      const result = path.join(sessionsDir, latest.id, "conversation.jsonl");
+      void debugLog(`[waitForConversationPath] Found via index: ${result}`);
+      return result;
     }
 
     if (existsSync(sessionsDir)) {
       const entries = await fs.readdir(sessionsDir, { withFileTypes: true });
       const dir = entries.find((entry) => entry.isDirectory() && !snapshot.has(entry.name));
       if (dir) {
-        return path.join(sessionsDir, dir.name, "conversation.jsonl");
+        const result = path.join(sessionsDir, dir.name, "conversation.jsonl");
+        void debugLog(`[waitForConversationPath] Found via directory scan: ${result}`);
+        return result;
       }
     }
 
     await sleep(200);
   }
 
+  void debugLog(`[waitForConversationPath] Timeout after 40 attempts`);
   return null;
 }
 
