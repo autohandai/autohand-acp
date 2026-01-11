@@ -85,7 +85,18 @@ interface FeedbackSubmission extends FeedbackResponse {
 
 const FEEDBACK_API_URL = "https://api.autohand.ai/v1/feedback";
 const FEEDBACK_COOLDOWN_HOURS = 48;
-const FEEDBACK_MIN_INTERACTIONS = 5;
+
+/**
+ * Generate random feedback trigger point: either 10, or randomly 5-8
+ */
+function generateFeedbackTrigger(): number {
+  // 50% chance of triggering at exactly 10
+  if (Math.random() < 0.5) {
+    return 10;
+  }
+  // Otherwise random between 5-8
+  return Math.floor(Math.random() * 4) + 5; // 5, 6, 7, or 8
+}
 
 // Simple device ID generator (anonymous, not tied to user identity)
 function getDeviceId(): string {
@@ -336,6 +347,8 @@ type SessionState = {
   interactionCount: number;
   lastFeedbackPrompt?: string; // ISO timestamp
   feedbackPending: boolean; // Waiting for feedback response
+  feedbackShownThisSession: boolean; // Only show feedback once per session
+  feedbackTriggerAt?: number; // Random trigger point (5-8 or 10)
   // Client identification
   clientName?: string; // e.g., "zed", "vscode"
   clientVersion?: string;
@@ -380,24 +393,16 @@ export class AutohandAcpAgent implements Agent {
     // Check authentication status
     const isAuthenticated = await checkAuthStatus();
 
-    // Build auth methods
+    // Build auth methods - only show login if not authenticated
     const authMethods: AuthMethod[] = [];
 
-    // Show login if not authenticated
     if (!isAuthenticated) {
       authMethods.push({
         id: "login",
         name: "Login to Autohand",
-        description: "Run `autohand login` in terminal to authenticate",
+        description: "Authenticate with your Autohand account",
       });
     }
-
-    // Always show feedback option
-    authMethods.push({
-      id: "feedback",
-      name: "Send Feedback",
-      description: "Run `autohand feedback` in terminal to send feedback",
-    });
 
     return {
       protocolVersion: params.protocolVersion ?? 1,
@@ -414,79 +419,101 @@ export class AutohandAcpAgent implements Agent {
   async authenticate(params: AuthenticateRequest): Promise<AuthenticateResponse> {
     const methodId = params?.methodId ?? "login";
 
+    // If using a stub, authentication is not needed
+    if (process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD)) {
+      return {};
+    }
+
+    if (methodId !== "login") {
+      return {};
+    }
+
     // Check if client supports terminal
     if (!this.clientCapabilities?.terminal) {
-      const action = methodId === "login" ? "login" : "feedback";
       throw RequestError.invalidRequest({
-        details: `Terminal not supported. Please run 'autohand ${action}' manually in your terminal.`,
+        details: "Please run `autohand login` in your terminal, then restart Zed.",
       });
     }
 
-    const autohandCmd = findAutohandBinary();
-    let command: string;
-    let args: string[];
-    let title: string;
-
-    if (methodId === "login") {
-      command = autohandCmd;
-      args = ["login"];
-      title = "Autohand Login";
-    } else if (methodId === "feedback") {
-      command = autohandCmd;
-      args = ["feedback"];
-      title = "Autohand Feedback";
-    } else {
-      throw RequestError.invalidParams({
-        details: `Unknown auth method: ${methodId}`,
-      });
-    }
-
-    // Create a temporary session ID for the terminal
+    // Create a temporary session for the login terminal
     const authSessionId = `auth-${randomUUID()}`;
+    const cwd = process.cwd();
+
+    // Register this session with Zed by storing it
+    this.sessions.set(authSessionId, {
+      id: authSessionId,
+      cwd,
+      history: [],
+      cancelled: false,
+      updateQueue: Promise.resolve(),
+      promptQueue: Promise.resolve({ stopReason: "end_turn" }),
+      availableModes: DEFAULT_MODES,
+      modeId: "default",
+      availableModels: DEFAULT_MODELS,
+      modelId: DEFAULT_MODELS[0]?.modelId ?? "",
+      availableCommands: DEFAULT_COMMANDS,
+      configOptions: [],
+      toolCalls: new Map(),
+      toolCallOutputs: new Map(),
+      streamingToolCalls: new Set(),
+      terminalToolCalls: new Set(),
+      conversationOffset: 0,
+      conversationRemainder: "",
+      hasStructuredOutput: false,
+      hasAgentResponse: false,
+      stdoutFallbackActive: false,
+      stdoutBuffer: "",
+      rawStdoutForStats: "",
+      useClientTerminal: false,
+      autohandHome: resolveAutohandHome(),
+      titleGenerated: false,
+      mcpServers: [],
+      interactionCount: 0,
+      feedbackPending: false,
+      feedbackShownThisSession: false,
+    });
 
     try {
-      // Create terminal using the temporary session
+      const { command, baseArgs } = findAutohandBinary();
+
       const terminal = await this.client.createTerminal({
         sessionId: authSessionId,
         command,
-        args,
-        title,
-        cwd: process.cwd(),
+        args: [...baseArgs, "login"],
+        title: "Autohand Login",
+        cwd,
       });
 
-      // Wait for terminal to complete
+      // Wait for login to complete
       const result = await terminal.waitForExit();
       await terminal.release();
 
-      // Check exit code for login
-      if (methodId === "login" && result.exitCode !== 0) {
+      // Clean up temp session
+      this.sessions.delete(authSessionId);
+
+      if (result.exitCode !== 0) {
         throw RequestError.invalidRequest({
-          details: `Login failed with exit code ${result.exitCode}. Please try again.`,
+          details: "Login cancelled or failed. Please try again.",
         });
       }
 
       return {};
-    } catch (error) {
-      // If it's already a RequestError, rethrow it
+    } catch (error: unknown) {
+      // Clean up on error
+      this.sessions.delete(authSessionId);
+
       if (error instanceof Error && "code" in error) {
         throw error;
       }
-      // Otherwise wrap it
+
+      const errMsg = error instanceof Error ? error.message : String(error);
       throw RequestError.invalidRequest({
-        details: `Authentication failed: ${error instanceof Error ? error.message : String(error)}`,
+        details: `Login failed: ${errMsg}`,
       });
     }
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
-    // Check if user is authenticated - if not, trigger auth banner
-    const isAuthenticated = await checkAuthStatus();
-    if (!isAuthenticated) {
-      throw RequestError.authRequired({
-        message: "Please login to use Autohand",
-      });
-    }
-
     if (!path.isAbsolute(params.cwd)) {
       throw RequestError.invalidParams({
         message: "Session cwd must be an absolute path.",
@@ -536,6 +563,8 @@ export class AutohandAcpAgent implements Agent {
       mcpServers,
       interactionCount: 0,
       feedbackPending: false,
+      feedbackShownThisSession: false,
+      feedbackTriggerAt: generateFeedbackTrigger(),
       clientName: this.clientInfo?.name,
       clientVersion: this.clientInfo?.version,
     });
@@ -684,6 +713,8 @@ export class AutohandAcpAgent implements Agent {
       mcpServers,
       interactionCount: 0,
       feedbackPending: false,
+      feedbackShownThisSession: false,
+      feedbackTriggerAt: generateFeedbackTrigger(),
       clientName: this.clientInfo?.name,
       clientVersion: this.clientInfo?.version,
     });
@@ -773,6 +804,8 @@ export class AutohandAcpAgent implements Agent {
       mcpServers,
       interactionCount: 0,
       feedbackPending: false,
+      feedbackShownThisSession: false,
+      feedbackTriggerAt: generateFeedbackTrigger(),
       clientName: this.clientInfo?.name,
       clientVersion: this.clientInfo?.version,
     });
@@ -841,6 +874,47 @@ export class AutohandAcpAgent implements Agent {
   private async executePrompt(session: SessionState, params: PromptRequest): Promise<PromptResponse> {
     if (!existsSync(session.cwd)) {
       await this.queueTextUpdate(session, `\n> **Error:** Workspace not found\n> \`${session.cwd}\`\n`);
+      return { stopReason: "end_turn" };
+    }
+
+    // Check if user needs to login - spawn terminal within this session
+    // Skip auth check if using a stub (for testing)
+    const isStub = process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
+    const isAuthenticated = isStub || await checkAuthStatus();
+    
+    if (!isAuthenticated && this.clientCapabilities?.terminal) {
+      const { command, baseArgs } = findAutohandBinary();
+      const fullArgs = [...baseArgs, "login"];
+      try {
+        await this.queueTextUpdate(session, `🔐 Authentication required. Opening login...\nCommand: ${command} ${fullArgs.join(" ")}\n`);
+
+        const terminal = await this.client.createTerminal({
+          sessionId: session.id,
+          command,
+          args: fullArgs,
+          title: "Autohand Login",
+          cwd: session.cwd,
+        });
+
+        await this.queueTextUpdate(session, "Terminal created, waiting for login...\n");
+
+        // Wait for login to complete
+        const result = await terminal.waitForExit();
+        await terminal.release();
+
+        if (result.exitCode !== 0) {
+          await this.queueTextUpdate(session, `❌ Login cancelled or failed (exit code: ${result.exitCode}). Please try again.\n`);
+          return { stopReason: "end_turn" };
+        }
+
+        await this.queueTextUpdate(session, "✅ Login successful! Processing your request...\n\n");
+      } catch (error: unknown) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        await this.queueTextUpdate(session, `❌ Could not open login terminal: ${errMsg}\nPlease run \`autohand login\` in your terminal.\n`);
+        return { stopReason: "end_turn" };
+      }
+    } else if (!isAuthenticated) {
+      await this.queueTextUpdate(session, "❌ Not authenticated and terminal not supported. Please run `autohand login` in your terminal.\n");
       return { stopReason: "end_turn" };
     }
 
@@ -1179,12 +1253,18 @@ export class AutohandAcpAgent implements Agent {
   }
 
   private async maybeShowFeedbackPrompt(session: SessionState): Promise<void> {
-    // Check if we should show feedback prompt
-    if (session.interactionCount < FEEDBACK_MIN_INTERACTIONS) {
+    // Only show feedback once per session
+    if (session.feedbackShownThisSession) {
       return;
     }
 
-    // Check cooldown (48 hours between prompts)
+    // Check if we've reached the trigger point for this session
+    const triggerAt = session.feedbackTriggerAt ?? 10;
+    if (session.interactionCount < triggerAt) {
+      return;
+    }
+
+    // Check global cooldown (48 hours between prompts across sessions)
     if (session.lastFeedbackPrompt) {
       const lastPrompt = new Date(session.lastFeedbackPrompt).getTime();
       const hoursSince = (Date.now() - lastPrompt) / 1000 / 60 / 60;
@@ -1193,25 +1273,20 @@ export class AutohandAcpAgent implements Agent {
       }
     }
 
-    // Only prompt every 5 interactions after minimum, with 30% probability
-    if ((session.interactionCount - FEEDBACK_MIN_INTERACTIONS) % 5 !== 0) {
-      return;
-    }
+    // Mark as shown for this session
+    session.feedbackShownThisSession = true;
+    session.lastFeedbackPrompt = new Date().toISOString();
 
-    if (Math.random() > 0.3) {
-      return;
-    }
-
-    // Show subtle feedback reminder
+    // Show feedback prompt with distinct styling
     const reminder = [
       "",
-      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-      "  💬 Quick feedback? Type /feedback",
-      "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
+      "╔══════════════════════════════════════════════╗",
+      "║  💭 How's your experience with Autohand?     ║",
+      "║     Type /feedback to share your thoughts    ║",
+      "╚══════════════════════════════════════════════╝",
       "",
     ];
     this.queueTextUpdate(session, reminder.join("\n"));
-    session.lastFeedbackPrompt = new Date().toISOString();
   }
 
   async cancel(params: CancelNotification): Promise<void> {
@@ -1324,6 +1399,8 @@ export class AutohandAcpAgent implements Agent {
       mcpServers,
       interactionCount: 0,
       feedbackPending: false,
+      feedbackShownThisSession: false,
+      feedbackTriggerAt: generateFeedbackTrigger(),
       clientName: this.clientInfo?.name,
       clientVersion: this.clientInfo?.version,
     });
@@ -1572,55 +1649,48 @@ export class AutohandAcpAgent implements Agent {
       return { handled: true };
     }
 
-    // Handle /feedback - send feedback to Autohand
+    // Handle /feedback - spawn terminal for interactive feedback
     if (command === "feedback") {
-      // Check if user provided a rating directly: /feedback 5 or /feedback 4 Great tool!
-      if (args.length > 0) {
-        const rating = parseInt(args[0], 10);
-        if (rating >= 1 && rating <= 5) {
-          const comment = args.slice(1).join(" ") || undefined;
-          const success = await this.submitUserFeedback(session, rating, comment, "manual");
-          if (success) {
-            const emoji = rating >= 4 ? "🎉" : rating >= 3 ? "👍" : "📝";
-            await this.queueTextUpdate(
-              session,
-              `${emoji} Thank you for your feedback! Rating: ${"★".repeat(rating)}${"☆".repeat(5 - rating)}\n`,
-            );
-          } else {
-            await this.queueTextUpdate(
-              session,
-              "Failed to submit feedback. Please try again later.\n",
-            );
-          }
-          return { handled: true };
-        }
+      // Check if client supports terminal
+      if (!this.clientCapabilities?.terminal) {
+        await this.queueTextUpdate(
+          session,
+          "Terminal not supported. Please run `autohand feedback` in your terminal.\n",
+        );
+        return { handled: true };
       }
 
-      // Show feedback prompt
-      const feedbackPrompt = [
-        "",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "  📊 Quick Feedback",
-        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-        "",
-        "How would you rate your experience with Autohand?",
-        "",
-        "  ★★★★★  5 - Excellent",
-        "  ★★★★☆  4 - Good",
-        "  ★★★☆☆  3 - Okay",
-        "  ★★☆☆☆  2 - Poor",
-        "  ★☆☆☆☆  1 - Very Poor",
-        "",
-        "Reply with: /feedback <1-5> [optional comment]",
-        "",
-        "Examples:",
-        "  /feedback 5",
-        "  /feedback 4 Love the tool!",
-        "  /feedback 3 Could use better error messages",
-        "",
-      ];
-      await this.queueTextUpdate(session, feedbackPrompt.join("\n") + "\n");
-      return { handled: true };
+      // Spawn terminal for feedback
+      const { command, baseArgs } = findAutohandBinary();
+      try {
+        await this.queueTextUpdate(session, "Opening feedback terminal...\n");
+
+        const terminal = await this.client.createTerminal({
+          sessionId: session.id,
+          command,
+          args: [...baseArgs, "-p", "/feedback"],
+          title: "Autohand Feedback",
+          cwd: session.cwd,
+        });
+
+        // Wait for terminal to complete in background
+        terminal.waitForExit().then(async (result) => {
+          await terminal.release();
+          if (result.exitCode === 0) {
+            this.queueTextUpdate(session, "✅ Thank you for your feedback!\n");
+          }
+        }).catch(() => {
+          // Ignore errors - user may have closed terminal
+        });
+
+        return { handled: true };
+      } catch {
+        await this.queueTextUpdate(
+          session,
+          `Failed to open feedback terminal. Please run \`autohand feedback\` in your terminal.\n`,
+        );
+        return { handled: true };
+      }
     }
 
     // Commands that should be passed to Autohand CLI
@@ -2808,8 +2878,19 @@ function resolveAutohandHome(): string {
 /**
  * Find the autohand binary path
  */
-function findAutohandBinary(): string {
-  return process.env.AUTOHAND_CMD ?? "autohand";
+type AutohandCommand = { command: string; baseArgs: string[] };
+
+function findAutohandBinary(): AutohandCommand {
+  // Use AUTOHAND_CMD if set
+  if (process.env.AUTOHAND_CMD) {
+    return { command: process.env.AUTOHAND_CMD, baseArgs: [] };
+  }
+  // Check if local dev CLI exists (has login command)
+  const localCli = "/Users/igorcosta/Documents/autohand/cli-3/dist/index.js";
+  if (existsSync(localCli)) {
+    return { command: "node", baseArgs: [localCli] };
+  }
+  return { command: "autohand", baseArgs: [] };
 }
 
 /**
