@@ -267,12 +267,12 @@ if (process.platform === "win32") {
 
       const result = await connection.prompt({
         sessionId,
-        prompt: [{ type: "text", text: "/mode ask" }],
+        prompt: [{ type: "text", text: "/mode interactive" }],
       });
 
       assert.equal(result.stopReason, "end_turn");
       const output = collectText(updates);
-      assert.match(output, /Mode changed to: Ask/);
+      assert.match(output, /Mode changed to: Interactive/);
     } finally {
       await cleanupChild(child);
     }
