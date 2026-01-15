@@ -364,9 +364,6 @@ export class AutohandAcpAgent implements Agent {
   async initialize(params: InitializeRequest): Promise<InitializeResponse> {
     this.clientCapabilities = params.clientCapabilities;
 
-    // Debug: log client capabilities
-    console.error("[ACP DEBUG] Client capabilities:", JSON.stringify(params.clientCapabilities, null, 2));
-
     // Capture client info (e.g., "zed", "Zed Editor")
     if (params.clientInfo) {
       this.clientInfo = {
@@ -395,7 +392,6 @@ export class AutohandAcpAgent implements Agent {
 
     // Check authentication status
     const isAuthenticated = await checkAuthStatus();
-    console.error("[ACP DEBUG] isAuthenticated:", isAuthenticated);
 
     // Build auth methods - only show login if not authenticated
     const authMethods: AuthMethod[] = [];
@@ -419,15 +415,11 @@ export class AutohandAcpAgent implements Agent {
       authMethods: authMethods.length > 0 ? authMethods : undefined,
     };
 
-    console.error("[ACP DEBUG] initialize response authMethods:", JSON.stringify(response.authMethods));
-
     return response;
   }
 
   async authenticate(params: AuthenticateRequest): Promise<AuthenticateResponse> {
     const methodId = params?.methodId ?? "login";
-
-    console.error("[ACP DEBUG] authenticate called with methodId:", methodId);
 
     // If using a stub, authentication is not needed
     if (process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD)) {
@@ -438,35 +430,42 @@ export class AutohandAcpAgent implements Agent {
       return {};
     }
 
-    // Check if client supports terminal
-    if (!this.clientCapabilities?.terminal) {
-      throw RequestError.invalidRequest({
-        details: "Please run `autohand login` in your terminal, then restart Zed.",
-      });
+    // Use terminal-based auth flow (like Auggie)
+    // This requires an existing session - authenticate is called after
+    // authRequired is thrown from prompt()
+    return this.authenticateWithTerminal();
+  }
+
+  /**
+   * Authenticate using terminal UI (like Auggie does)
+   * Runs the Autohand CLI login command which handles the device auth flow
+   */
+  private async authenticateWithTerminal(): Promise<AuthenticateResponse> {
+    // Get an existing session ID - authenticate is called after authRequired
+    // is thrown from prompt(), so there should be a session
+    const existingSessionId = this.sessions.keys().next().value;
+    if (!existingSessionId) {
+      throw new Error("No session available for terminal authentication");
     }
 
-    const cwd = process.cwd();
+    const session = this.sessions.get(existingSessionId);
+    const cwd = session?.cwd || process.cwd();
 
     try {
       const { command, baseArgs } = findAutohandBinary();
 
-      console.error("[ACP DEBUG] Creating auth terminal with command:", command, "args:", [...baseArgs, "login"]);
-
-      // For authentication, use empty sessionId - Zed should handle auth terminals specially
+      // Create terminal running the Autohand login command
       const terminal = await this.client.createTerminal({
-        sessionId: "" as any, // Auth terminals don't have a session yet
+        sessionId: existingSessionId,
         command,
         args: [...baseArgs, "login"],
         cwd,
+        title: "Autohand Login",
       });
-
-      console.error("[ACP DEBUG] Terminal created:", terminal.id);
 
       // Wait for login to complete
       const result = await terminal.waitForExit();
       await terminal.release();
-
-      console.error("[ACP DEBUG] Terminal exited with code:", result.exitCode);
 
       if (result.exitCode !== 0) {
         throw RequestError.invalidRequest({
@@ -476,13 +475,15 @@ export class AutohandAcpAgent implements Agent {
 
       return {};
     } catch (error: unknown) {
-      console.error("[ACP DEBUG] authenticate error:", error);
-
       if (error instanceof Error && "code" in error) {
         throw error;
       }
 
-      const errMsg = error instanceof Error ? error.message : String(error);
+      const errMsg = error instanceof Error
+        ? error.message
+        : typeof error === "object" && error !== null
+          ? JSON.stringify(error)
+          : String(error);
       throw RequestError.invalidRequest({
         details: `Login failed: ${errMsg}`,
       });
@@ -564,11 +565,23 @@ export class AutohandAcpAgent implements Agent {
     // Use setImmediate to ensure the response is sent first
     const session = this.sessions.get(sessionId);
     if (session) {
-      setImmediate(() => {
+      setImmediate(async () => {
         void this.queueSessionUpdate(session, {
           sessionUpdate: "available_commands_update",
           availableCommands: availableCommands,
         });
+
+        // Check authentication and send a welcome message prompting login
+        const isStub = process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
+        const isAuthenticated = isStub || await checkAuthStatus();
+
+        if (!isAuthenticated) {
+          // Send a message to prompt the user to log in
+          void this.queueSessionUpdate(session, {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: "Welcome! Please send a message to get started. You'll be prompted to log in." },
+          });
+        }
       });
     }
 
@@ -853,47 +866,15 @@ export class AutohandAcpAgent implements Agent {
       return { stopReason: "end_turn" };
     }
 
-    // Check if user needs to login - spawn terminal within this session
-    // Skip auth check if using a stub (for testing)
+    // Check authentication
     const isStub = process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
     const isAuthenticated = isStub || await checkAuthStatus();
 
-    // Debug: log auth check results
-    console.error("[ACP DEBUG] Auth check - isStub:", isStub, "isAuthenticated:", isAuthenticated, "terminal capability:", this.clientCapabilities?.terminal);
-
-    if (!isAuthenticated && this.clientCapabilities?.terminal) {
-      const { command, baseArgs } = findAutohandBinary();
-      const fullArgs = [...baseArgs, "login"];
-      try {
-        // Create terminal in Zed's terminal panel (like Auggie does)
-        const terminal = await this.client.createTerminal({
-          sessionId: session.id,
-          command,
-          args: fullArgs,
-          cwd: session.cwd,
-        });
-
-        await this.queueTextUpdate(session, "🔐 **Authentication required**\n\nLogin terminal opened. Complete the authentication in your browser.\n");
-
-        // Wait for login to complete
-        const exitStatus = await terminal.waitForExit();
-        await terminal.release();
-
-        if (exitStatus.exitCode === 0) {
-          await this.queueTextUpdate(session, "\n✅ **Login successful!** Send your message again.\n");
-        } else {
-          await this.queueTextUpdate(session, "\n❌ **Login cancelled or failed.** Please try again.\n");
-        }
-
-        return { stopReason: "end_turn" };
-      } catch (error: unknown) {
-        const errMsg = error instanceof Error ? error.message : String(error);
-        await this.queueTextUpdate(session, `❌ Could not open login terminal: ${errMsg}\n\nPlease run \`autohand login\` in your terminal.\n`);
-        return { stopReason: "end_turn" };
-      }
-    } else if (!isAuthenticated) {
-      await this.queueTextUpdate(session, "❌ Not authenticated and terminal not supported. Please run `autohand login` in your terminal.\n");
-      return { stopReason: "end_turn" };
+    if (!isAuthenticated) {
+      // Throw authRequired error to trigger Zed's auth flow
+      throw RequestError.authRequired({
+        message: "Please log in to use Autohand",
+      });
     }
 
     const resolvedPrompt = await this.resolvePromptBlocks(session, params.prompt);
@@ -1300,6 +1281,26 @@ export class AutohandAcpAgent implements Agent {
         session.activeProcess.kill("SIGKILL");
       }
     }, 2000);
+  }
+
+  /**
+   * Extension method handler for custom ACP requests.
+   * Allows clients to send arbitrary requests that are not part of the ACP spec.
+   */
+  async extMethod(method: string, _params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    // Handle custom extension methods here
+    // Currently no custom methods are implemented
+    throw RequestError.methodNotFound(method);
+  }
+
+  /**
+   * Extension notification handler for custom ACP notifications.
+   * Allows clients to send arbitrary notifications that are not part of the ACP spec.
+   */
+  async extNotification(_method: string, _params: Record<string, unknown>): Promise<void> {
+    // Handle custom extension notifications here
+    // Currently no custom notifications are implemented
+    // Notifications don't return errors, just silently ignore unknown ones
   }
 
   async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
@@ -2001,7 +2002,6 @@ export class AutohandAcpAgent implements Agent {
         markAgentResponse();
         await this.queueTextUpdate(session, responseText + "\n");
         session.history.push({ role: "assistant", content: responseText });
-      } else {
       }
 
       // Handle tool calls
@@ -2912,8 +2912,6 @@ async function waitForConversationPath(
     const candidates = sessions
       .filter((session) => !snapshot.has(session.id) && path.resolve(session.projectPath) === resolvedCwd)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    if (attempts === 0 || attempts % 10 === 0) {
-    }
     if (candidates.length > 0) {
       for (const candidate of candidates) {
         const result = path.join(sessionsDir, candidate.id, "conversation.jsonl");
