@@ -398,10 +398,17 @@ export class AutohandAcpAgent implements Agent {
 
     if (!isAuthenticated) {
       authMethods.push({
-        id: "login",
+        id: "autohand-login",
         name: "Login to Autohand",
-        description: "Authenticate with your Autohand account",
-      });
+        description: "Sign in with your Autohand account",
+        _meta: {
+          "terminal-auth": {
+            command: "autohand",
+            args: ["login"],
+            label: "Autohand Login",
+          },
+        },
+      } as AuthMethod);
     }
 
     const response = {
@@ -418,76 +425,33 @@ export class AutohandAcpAgent implements Agent {
     return response;
   }
 
-  async authenticate(params: AuthenticateRequest): Promise<AuthenticateResponse> {
-    const methodId = params?.methodId ?? "login";
-
-    // If using a stub, authentication is not needed
-    if (process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD)) {
+  async authenticate(_params: AuthenticateRequest): Promise<AuthenticateResponse> {
+    // Check if already authenticated
+    const isStub = process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
+    if (isStub || await checkAuthStatus()) {
       return {};
     }
 
-    if (methodId !== "login") {
-      return {};
-    }
+    // Check if client supports terminal-auth (like Zed does)
+    // If so, the client handles running the terminal command itself
+    const meta = (this.clientCapabilities as { _meta?: Record<string, unknown> })?._meta;
+    const supportsTerminalAuth = meta?.["terminal-auth"] === true;
 
-    // Use terminal-based auth flow (like Auggie)
-    // This requires an existing session - authenticate is called after
-    // authRequired is thrown from prompt()
-    return this.authenticateWithTerminal();
-  }
-
-  /**
-   * Authenticate using terminal UI (like Auggie does)
-   * Runs the Autohand CLI login command which handles the device auth flow
-   */
-  private async authenticateWithTerminal(): Promise<AuthenticateResponse> {
-    // Get an existing session ID - authenticate is called after authRequired
-    // is thrown from prompt(), so there should be a session
-    const existingSessionId = this.sessions.keys().next().value;
-    if (!existingSessionId) {
-      throw new Error("No session available for terminal authentication");
-    }
-
-    const session = this.sessions.get(existingSessionId);
-    const cwd = session?.cwd || process.cwd();
-
-    try {
-      const { command, baseArgs } = findAutohandBinary();
-
-      // Create terminal running the Autohand login command
-      const terminal = await this.client.createTerminal({
-        sessionId: existingSessionId,
-        command,
-        args: [...baseArgs, "login"],
-        cwd,
-        title: "Autohand Login",
-      });
-
-      // Wait for login to complete
-      const result = await terminal.waitForExit();
-      await terminal.release();
-
-      if (result.exitCode !== 0) {
-        throw RequestError.invalidRequest({
-          details: "Login cancelled or failed. Please try again.",
-        });
-      }
-
-      return {};
-    } catch (error: unknown) {
-      if (error instanceof Error && "code" in error) {
-        throw error;
-      }
-
-      const errMsg = error instanceof Error
-        ? error.message
-        : typeof error === "object" && error !== null
-          ? JSON.stringify(error)
-          : String(error);
-      throw RequestError.invalidRequest({
-        details: `Login failed: ${errMsg}`,
+    if (!supportsTerminalAuth) {
+      // Client doesn't support terminal-auth, tell user to run manually
+      throw RequestError.authRequired({
+        message: "Please run `autohand login` in your terminal, then try again.",
       });
     }
+
+    // With terminal-auth, client ran the login command - just verify it worked
+    if (!await checkAuthStatus()) {
+      throw RequestError.authRequired({
+        message: "Login was not completed. Please try again.",
+      });
+    }
+
+    return {};
   }
 
   async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
@@ -496,6 +460,21 @@ export class AutohandAcpAgent implements Agent {
         message: "Session cwd must be an absolute path.",
         cwd: params.cwd,
       });
+    }
+
+    // Check authentication - if not logged in, throw authRequired
+    // With terminal-auth support in authMethods, Zed will open a terminal
+    const isStub = process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
+    if (!isStub && !await checkAuthStatus()) {
+      // Check if client supports terminal-auth
+      const meta = (this.clientCapabilities as { _meta?: Record<string, unknown> })?._meta;
+      const supportsTerminalAuth = meta?.["terminal-auth"] === true;
+
+      const message = supportsTerminalAuth
+        ? "Please log in to use Autohand"
+        : "Please run `autohand login` in your terminal, then try again.";
+
+      throw RequestError.authRequired({ message });
     }
 
     const availableModes = parseAvailableModes();
@@ -561,7 +540,7 @@ export class AutohandAcpAgent implements Agent {
     const currentModel = availableModels.find(m => m.modelId === modelId);
     void getTelemetryClient().startSession(sessionId, currentModel?.name || modelId);
 
-    // Send commands notification AFTER the response is returned
+    // Send commands notification and welcome message AFTER the response is returned
     // Use setImmediate to ensure the response is sent first
     const session = this.sessions.get(sessionId);
     if (session) {
@@ -571,17 +550,13 @@ export class AutohandAcpAgent implements Agent {
           availableCommands: availableCommands,
         });
 
-        // Check authentication and send a welcome message prompting login
-        const isStub = process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
-        const isAuthenticated = isStub || await checkAuthStatus();
-
-        if (!isAuthenticated) {
-          // Send a message to prompt the user to log in
-          void this.queueSessionUpdate(session, {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "Welcome! Please send a message to get started. You'll be prompted to log in." },
-          });
-        }
+        // Send welcome message with user's name
+        const userInfo = await getUserInfo();
+        const userName = userInfo?.name?.split(" ")[0] || "there";
+        void this.queueSessionUpdate(session, {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `Hey ${userName}! How can I help you today?` },
+        });
       });
     }
 
@@ -2886,6 +2861,26 @@ async function checkAuthStatus(): Promise<boolean> {
     return false;
   } catch {
     return false;
+  }
+}
+
+/**
+ * Get authenticated user info from config
+ */
+async function getUserInfo(): Promise<{ name?: string; email?: string } | null> {
+  const configPath = path.join(resolveAutohandHome(), "config.json");
+  try {
+    const configContent = await fs.readFile(configPath, "utf-8");
+    const config = JSON.parse(configContent);
+    if (config.auth?.user) {
+      return {
+        name: config.auth.user.name,
+        email: config.auth.user.email,
+      };
+    }
+    return null;
+  } catch {
+    return null;
   }
 }
 
