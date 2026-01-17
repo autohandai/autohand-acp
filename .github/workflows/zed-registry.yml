@@ -211,11 +211,9 @@ jobs:
           # Push to fork
           git push -u origin "$BRANCH" --force
 
-          # Create PR
-          PR_URL=$(gh pr create \
-            --repo zed-industries/extensions \
-            --title "Add autohand-acp extension v$VERSION" \
-            --body "## Extension: Autohand CLI
+          # Create PR body
+          PR_BODY=$(cat << PREOF
+## Extension: Autohand CLI
 
 AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP).
 
@@ -231,7 +229,15 @@ AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP).
 
 ### Links
 - Repository: https://github.com/$REPO
-- Release: https://github.com/$REPO/releases/tag/v$VERSION" \
+- Release: https://github.com/$REPO/releases/tag/v$VERSION
+PREOF
+          )
+
+          # Create PR
+          PR_URL=$(gh pr create \
+            --repo zed-industries/extensions \
+            --title "Add autohand-acp extension v$VERSION" \
+            --body "$PR_BODY" \
             --head "$FORK_OWNER:$BRANCH" \
             --base main 2>&1) || true
 
