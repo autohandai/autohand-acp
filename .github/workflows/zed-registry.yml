@@ -74,6 +74,16 @@ jobs:
           git config --global user.name "igorcosta"
           git config --global user.email "igorcosta@users.noreply.github.com"
 
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Create PR to Zed Registry
         env:
           GH_TOKEN: ${{ secrets.ZED_REGISTRY_PAT }}
@@ -109,7 +119,7 @@ jobs:
             echo "5. Sort and commit:"
             echo "   pnpm sort-extensions"
             echo "   git add ."
-            echo "   git commit -m \"Add autohand-acp extension v$VERSION\""
+            echo "   git commit -m \"Update autohand-acp extension to v$VERSION\""
             echo "   git push origin main"
             echo ""
             echo "6. Create PR: https://github.com/zed-industries/extensions/compare"
@@ -142,7 +152,7 @@ jobs:
           git reset --hard upstream/main
 
           # Create a branch for the PR
-          BRANCH="add-autohand-acp-v$VERSION"
+          BRANCH="update-autohand-acp-v$VERSION"
           git checkout -b "$BRANCH"
 
           # Add our extension as submodule (remove first if exists)
@@ -174,11 +184,9 @@ jobs:
             printf '\n[autohand-acp]\nsubmodule = "extensions/autohand-acp"\nversion = "%s"\n' "$VERSION" >> extensions.toml
           fi
 
-          # Sort extensions (if pnpm available)
-          if command -v pnpm &> /dev/null; then
-            pnpm install
-            pnpm sort-extensions || true
-          fi
+          # Sort extensions (required by Zed CI)
+          pnpm install
+          pnpm sort-extensions
 
           # Check if there are changes to commit
           git add .
@@ -193,7 +201,7 @@ jobs:
           fi
 
           # Commit changes
-          git commit -m "Add autohand-acp extension v$VERSION"
+          git commit -m "Update autohand-acp extension to v$VERSION"
 
           # Push to fork
           git push -u origin "$BRANCH" --force
@@ -201,8 +209,8 @@ jobs:
           # Create PR
           PR_URL=$(gh pr create \
             --repo zed-industries/extensions \
-            --title "Add autohand-acp extension v$VERSION" \
-            --body "Autohand CLI extension v$VERSION - AI coding agent via ACP. See https://github.com/$REPO" \
+            --title "Update autohand-acp extension to v$VERSION" \
+            --body "Update Autohand CLI extension to v$VERSION - AI coding agent via ACP. See https://github.com/$REPO" \
             --head "$FORK_OWNER:$BRANCH" \
             --base main 2>&1) || true
 
