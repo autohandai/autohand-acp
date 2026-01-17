@@ -94,15 +94,16 @@ jobs:
             echo "1. Fork https://github.com/zed-industries/extensions"
             echo ""
             echo "2. Clone your fork:"
-            echo "   git clone https://github.com/YOUR_USERNAME/extensions.git"
+            echo "   git clone --recursive https://github.com/YOUR_USERNAME/extensions.git"
             echo "   cd extensions"
             echo ""
             echo "3. Add the extension as a submodule:"
             echo "   git submodule add https://github.com/$REPO.git extensions/autohand-acp"
+            echo "   cd extensions/autohand-acp && git checkout v$VERSION && cd ../.."
             echo ""
             echo "4. Add to extensions.toml:"
-            echo "   [autohand-acp]"
-            echo "   submodule = \"extensions/autohand-acp\""
+            echo '   [autohand-acp]'
+            echo '   submodule = "extensions/autohand-acp"'
             echo "   version = \"$VERSION\""
             echo ""
             echo "5. Sort and commit:"
@@ -129,8 +130,8 @@ jobs:
           FORK_OWNER=$(gh api user --jq '.login')
           echo "Fork owner: $FORK_OWNER"
 
-          # Clone the fork using gh (which handles auth)
-          gh repo clone "$FORK_OWNER/extensions" zed-extensions -- --depth=1
+          # Clone the fork with submodules
+          gh repo clone "$FORK_OWNER/extensions" zed-extensions -- --recurse-submodules
           cd zed-extensions
 
           # Set up remotes with auth
@@ -140,82 +141,112 @@ jobs:
           git checkout main
           git reset --hard upstream/main
 
+          # Initialize submodules after reset
+          git submodule update --init --recursive
+
           # Create a branch for the PR
           BRANCH="add-autohand-acp-v$VERSION"
           git checkout -b "$BRANCH"
 
-          # Check if extension already exists
-          if [ -d "extensions/autohand-acp" ]; then
-            echo "Extension already exists, updating..."
+          # Check if extension already exists as submodule
+          if [ -d "extensions/autohand-acp" ] && [ -f "extensions/autohand-acp/.git" ]; then
+            echo "Extension submodule already exists, updating to v$VERSION..."
             cd extensions/autohand-acp
-            git fetch origin
-            git checkout "v$VERSION" || git checkout main
+            git fetch origin --tags
+            git checkout "v$VERSION"
             cd ../..
-          else
-            echo "Adding new extension..."
+            git add extensions/autohand-acp
+          elif [ -d "extensions/autohand-acp" ]; then
+            echo "Extension directory exists but not as submodule, removing and re-adding..."
+            rm -rf extensions/autohand-acp
             git submodule add "https://github.com/$REPO.git" extensions/autohand-acp
             cd extensions/autohand-acp
-            git checkout "v$VERSION" || git checkout main
+            git checkout "v$VERSION"
+            cd ../..
+          else
+            echo "Adding new extension submodule..."
+            git submodule add "https://github.com/$REPO.git" extensions/autohand-acp
+            cd extensions/autohand-acp
+            git checkout "v$VERSION"
             cd ../..
           fi
 
           # Update extensions.toml
           if grep -q "\[autohand-acp\]" extensions.toml; then
-            # Update existing entry
-            sed -i "/\[autohand-acp\]/,/^$/s/version = .*/version = \"$VERSION\"/" extensions.toml
+            echo "Updating existing entry in extensions.toml..."
+            # Update version in existing entry using awk for reliable multiline handling
+            awk -v ver="$VERSION" '
+              /^\[autohand-acp\]/ { in_section=1 }
+              in_section && /^version = / { $0="version = \"" ver "\""; in_section=0 }
+              in_section && /^\[/ && !/^\[autohand-acp\]/ { in_section=0 }
+              { print }
+            ' extensions.toml > extensions.toml.tmp && mv extensions.toml.tmp extensions.toml
           else
-            # Add new entry (will be sorted later)
-            cat >> extensions.toml << EOF
-
-          [autohand-acp]
-          submodule = "extensions/autohand-acp"
-          version = "$VERSION"
-          EOF
+            echo "Adding new entry to extensions.toml..."
+            # Add new entry without leading spaces
+            printf '\n[autohand-acp]\nsubmodule = "extensions/autohand-acp"\nversion = "%s"\n' "$VERSION" >> extensions.toml
           fi
 
           # Sort extensions (if pnpm available)
           if command -v pnpm &> /dev/null; then
             pnpm install
-            pnpm sort-extensions
+            pnpm sort-extensions || true
+          fi
+
+          # Check if there are changes to commit
+          git add .
+          if git diff --cached --quiet; then
+            echo ""
+            echo "================================================"
+            echo "NO CHANGES DETECTED"
+            echo "================================================"
+            echo "The extension may already be at v$VERSION in the registry."
+            echo "Check: https://github.com/zed-industries/extensions"
+            exit 0
           fi
 
           # Commit changes
-          git add .
           git commit -m "Add autohand-acp extension v$VERSION"
 
           # Push to fork
           git push -u origin "$BRANCH" --force
 
           # Create PR
-          PR_BODY=$(cat << 'PREOF'
-          ## Extension: Autohand CLI
-
-          AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP).
-
-          ### Features
-          - File editing and code modifications
-          - Code search across codebase
-          - Terminal command execution
-          - Session management and history
-          - Permission controls (external/auto/restricted)
-          - Dynamic session titles
-          - Image/screenshot support
-          - MCP server integration
-
-          ### Links
-          - Repository: https://github.com/${{ github.repository }}
-          - Release: https://github.com/${{ github.repository }}/releases/tag/v${{ steps.version.outputs.version }}
-          PREOF
-          )
-
-          gh pr create \
+          PR_URL=$(gh pr create \
             --repo zed-industries/extensions \
             --title "Add autohand-acp extension v$VERSION" \
-            --body "$PR_BODY" \
+            --body "## Extension: Autohand CLI
+
+AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP).
+
+### Features
+- File editing and code modifications
+- Code search across codebase
+- Terminal command execution
+- Session management and history
+- Permission controls (external/auto/restricted)
+- Dynamic session titles
+- Image/screenshot support
+- MCP server integration
+
+### Links
+- Repository: https://github.com/$REPO
+- Release: https://github.com/$REPO/releases/tag/v$VERSION" \
             --head "$FORK_OWNER:$BRANCH" \
-            --base main
+            --base main 2>&1) || true
+
+          if echo "$PR_URL" | grep -q "already exists"; then
+            echo ""
+            echo "================================================"
+            echo "PR ALREADY EXISTS"
+            echo "================================================"
+            echo "A PR for this version may already be open."
+            gh pr list --repo zed-industries/extensions --author "$FORK_OWNER" --state open
+            exit 0
+          fi
 
           echo ""
           echo "================================================"
           echo "PR created successfully!"
+          echo "$PR_URL"
           echo "================================================"
