@@ -61,7 +61,10 @@ import {
   stripAnsi,
   truncateText,
 } from "./utils.js";
-import { createPermissionServer, type PermissionServer } from "./permission-server.js";
+import {
+  createPermissionServer,
+  type PermissionServer,
+} from "./permission-server.js";
 import { getTelemetryClient } from "./telemetry.js";
 
 // ============ Feedback Types & Client ============
@@ -162,15 +165,31 @@ const DEFAULT_COMMANDS: AvailableCommand[] = [
   { name: "feedback", description: "Send feedback to Autohand" },
   { name: "agents", description: "List available agents" },
   { name: "hooks", description: "Manage lifecycle hooks" },
-  { name: "automode", description: "Run autonomous agent loop" },
+  { name: "automode", description: "Toggle autonomous agent loop" },
+  { name: "add-dir", description: "Add additional working directory" },
+  { name: "remove-dir", description: "Remove additional working directory" },
   { name: "share", description: "Share session transcript" },
   { name: "formatters", description: "Manage code formatters" },
   { name: "lint", description: "Run code linting" },
 ];
 const DEFAULT_MODES: SessionMode[] = [
-  { id: "interactive", name: "Interactive", description: "Ask before each action" },
+  {
+    id: "interactive",
+    name: "Interactive",
+    description: "Ask before each action",
+  },
   { id: "full-access", name: "Full access", description: "Allow all actions" },
-  { id: "restricted", name: "Restricted", description: "Block dangerous actions" },
+  {
+    id: "unrestricted",
+    name: "Unrestricted",
+    description: "Skip all approval prompts",
+  },
+  { id: "auto-mode", name: "Auto-mode", description: "Autonomous agent loop" },
+  {
+    id: "restricted",
+    name: "Restricted",
+    description: "Block dangerous actions",
+  },
   { id: "dry-run", name: "Dry run", description: "Preview without executing" },
 ];
 
@@ -342,7 +361,12 @@ type SessionState = {
   title?: string;
   titleGenerated: boolean;
   parentSessionId?: string; // For forked sessions
-  mcpServers: Array<{ name: string; type: string; url?: string; command?: string }>;
+  mcpServers: Array<{
+    name: string;
+    type: string;
+    url?: string;
+    command?: string;
+  }>;
   // Feedback tracking
   interactionCount: number;
   lastFeedbackPrompt?: string; // ISO timestamp
@@ -352,6 +376,13 @@ type SessionState = {
   // Client identification
   clientName?: string; // e.g., "zed", "vscode"
   clientVersion?: string;
+  // Auto-mode state
+  autoModeEnabled: boolean;
+  autoModeMaxIterations: number;
+  autoModeMaxRuntime: number; // in minutes
+  autoModeMaxCost: number; // in dollars
+  // Multi-directory support
+  additionalDirs: string[];
 };
 
 export class AutohandAcpAgent implements Agent {
@@ -380,35 +411,55 @@ export class AutohandAcpAgent implements Agent {
       },
       loadSession: true,
       mcpCapabilities: {
-        http: true,  // Support HTTP MCP servers
-        sse: true,   // Support SSE MCP servers
+        http: true, // Support HTTP MCP servers
+        sse: true, // Support SSE MCP servers
       },
       sessionCapabilities: {
-        list: {},    // Support session/list
-        resume: {},  // Support session/resume
-        fork: {},    // Support session/fork
+        list: {}, // Support session/list
+        resume: {}, // Support session/resume
+        fork: {}, // Support session/fork
       },
     };
 
-    // Check authentication status
-    const isAuthenticated = await checkAuthStatus();
+    // Check if Autohand CLI is installed
+    const cliCheck = await checkCliInstalled();
 
-    // Build auth methods - only show login if not authenticated
+    // Build auth methods based on CLI and auth status
     const authMethods: AuthMethod[] = [];
 
-    if (!isAuthenticated) {
+    if (!cliCheck.installed) {
+      // CLI not installed - show install instructions as auth method
       authMethods.push({
-        id: "autohand-login",
-        name: "Login to Autohand",
-        description: "Sign in with your Autohand account",
+        id: "autohand-install",
+        name: "Install Autohand CLI",
+        description:
+          cliCheck.error || "Autohand CLI is required but not installed",
         _meta: {
           "terminal-auth": {
-            command: "autohand",
-            args: ["login"],
-            label: "Autohand Login",
+            command: "npm",
+            args: ["install", "-g", "autohand-cli"],
+            label: "Install Autohand CLI",
           },
         },
       } as AuthMethod);
+    } else {
+      // CLI installed - check authentication status
+      const isAuthenticated = await checkAuthStatus();
+
+      if (!isAuthenticated) {
+        authMethods.push({
+          id: "autohand-login",
+          name: "Login to Autohand",
+          description: "Sign in with your Autohand account",
+          _meta: {
+            "terminal-auth": {
+              command: "autohand",
+              args: ["login"],
+              label: "Autohand Login",
+            },
+          },
+        } as AuthMethod);
+      }
     }
 
     const response = {
@@ -418,34 +469,48 @@ export class AutohandAcpAgent implements Agent {
         name: packageJson.name,
         title: "Autohand CLI",
         version: packageJson.version,
+        ...(cliCheck.version && { _meta: { cliVersion: cliCheck.version } }),
       },
       authMethods: authMethods.length > 0 ? authMethods : undefined,
+      // Include warning if CLI not installed
+      ...(!cliCheck.installed && {
+        _meta: {
+          warning: cliCheck.error,
+          installUrl: "https://autohand.ai/docs/guides/zed-integration",
+        },
+      }),
     };
 
     return response;
   }
 
-  async authenticate(_params: AuthenticateRequest): Promise<AuthenticateResponse> {
+  async authenticate(
+    _params: AuthenticateRequest,
+  ): Promise<AuthenticateResponse> {
     // Check if already authenticated
-    const isStub = process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
-    if (isStub || await checkAuthStatus()) {
+    const isStub =
+      process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
+    if (isStub || (await checkAuthStatus())) {
       return {};
     }
 
     // Check if client supports terminal-auth (like Zed does)
     // If so, the client handles running the terminal command itself
-    const meta = (this.clientCapabilities as { _meta?: Record<string, unknown> })?._meta;
+    const meta = (
+      this.clientCapabilities as { _meta?: Record<string, unknown> }
+    )?._meta;
     const supportsTerminalAuth = meta?.["terminal-auth"] === true;
 
     if (!supportsTerminalAuth) {
       // Client doesn't support terminal-auth, tell user to run manually
       throw RequestError.authRequired({
-        message: "Please run `autohand login` in your terminal, then try again.",
+        message:
+          "Please run `autohand login` in your terminal, then try again.",
       });
     }
 
     // With terminal-auth, client ran the login command - just verify it worked
-    if (!await checkAuthStatus()) {
+    if (!(await checkAuthStatus())) {
       throw RequestError.authRequired({
         message: "Login was not completed. Please try again.",
       });
@@ -464,10 +529,13 @@ export class AutohandAcpAgent implements Agent {
 
     // Check authentication - if not logged in, throw authRequired
     // With terminal-auth support in authMethods, Zed will open a terminal
-    const isStub = process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
-    if (!isStub && !await checkAuthStatus()) {
+    const isStub =
+      process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
+    if (!isStub && !(await checkAuthStatus())) {
       // Check if client supports terminal-auth
-      const meta = (this.clientCapabilities as { _meta?: Record<string, unknown> })?._meta;
+      const meta = (
+        this.clientCapabilities as { _meta?: Record<string, unknown> }
+      )?._meta;
       const supportsTerminalAuth = meta?.["terminal-auth"] === true;
 
       const message = supportsTerminalAuth
@@ -480,10 +548,12 @@ export class AutohandAcpAgent implements Agent {
     const availableModes = parseAvailableModes();
     const modeId = resolveDefaultMode(availableModes);
     const availableModels = await parseAvailableModelsAsync();
-    const modelId = resolveDefaultModel(availableModels);
+    const modelId = await resolveDefaultModelAsync(availableModels);
     const availableCommands = parseAvailableCommands();
-    const configOptions = buildConfigOptions();
-    const useClientTerminal = isTruthy(process.env.AUTOHAND_USE_CLIENT_TERMINAL);
+    const configOptions = await buildConfigOptionsAsync();
+    const useClientTerminal = isTruthy(
+      process.env.AUTOHAND_USE_CLIENT_TERMINAL,
+    );
 
     // Store MCP servers from client for later use
     const mcpServers = parseMcpServers(params.mcpServers);
@@ -523,22 +593,47 @@ export class AutohandAcpAgent implements Agent {
       feedbackTriggerAt: generateFeedbackTrigger(),
       clientName: this.clientInfo?.name,
       clientVersion: this.clientInfo?.version,
+      // Auto-mode state
+      autoModeEnabled: isTruthy(process.env.AUTOHAND_AUTO_MODE),
+      autoModeMaxIterations: parseInt(
+        process.env.AUTOHAND_AUTO_MODE_MAX_ITERATIONS ?? "50",
+        10,
+      ),
+      autoModeMaxRuntime: parseInt(
+        process.env.AUTOHAND_AUTO_MODE_MAX_RUNTIME ?? "120",
+        10,
+      ),
+      autoModeMaxCost: parseInt(
+        process.env.AUTOHAND_AUTO_MODE_MAX_COST ?? "10",
+        10,
+      ),
+      // Multi-directory support
+      additionalDirs: [],
     });
 
     const response: NewSessionResponse = { sessionId };
     if (availableModes.length > 0) {
-      response.modes = { availableModes, currentModeId: modeId } as SessionModeState;
+      response.modes = {
+        availableModes,
+        currentModeId: modeId,
+      } as SessionModeState;
     }
     if (availableModels.length > 0) {
-      response.models = { availableModels, currentModelId: modelId } as SessionModelState;
+      response.models = {
+        availableModels,
+        currentModelId: modelId,
+      } as SessionModelState;
     }
     if (configOptions.length > 0) {
       response.configOptions = configOptions;
     }
 
     // Track session start in telemetry
-    const currentModel = availableModels.find(m => m.modelId === modelId);
-    void getTelemetryClient().startSession(sessionId, currentModel?.name || modelId);
+    const currentModel = availableModels.find((m) => m.modelId === modelId);
+    void getTelemetryClient().startSession(
+      sessionId,
+      currentModel?.name || modelId,
+    );
 
     // Send commands notification and welcome message AFTER the response is returned
     // Use setImmediate to ensure the response is sent first
@@ -555,7 +650,10 @@ export class AutohandAcpAgent implements Agent {
         const userName = userInfo?.name?.split(" ")[0] || "there";
         void this.queueSessionUpdate(session, {
           sessionUpdate: "agent_message_chunk",
-          content: { type: "text", text: `Hey ${userName}! How can I help you today?` },
+          content: {
+            type: "text",
+            text: `Hey ${userName}! How can I help you today?`,
+          },
         });
       });
     }
@@ -563,7 +661,9 @@ export class AutohandAcpAgent implements Agent {
     return response;
   }
 
-  async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
+  async setSessionMode(
+    params: SetSessionModeRequest,
+  ): Promise<SetSessionModeResponse> {
     const session = this.sessions.get(params.sessionId);
     if (!session) {
       throw RequestError.invalidParams({
@@ -584,7 +684,9 @@ export class AutohandAcpAgent implements Agent {
     return {};
   }
 
-  async unstable_setSessionModel(params: SetSessionModelRequest): Promise<SetSessionModelResponse> {
+  async unstable_setSessionModel(
+    params: SetSessionModelRequest,
+  ): Promise<SetSessionModelResponse> {
     const session = this.sessions.get(params.sessionId);
     if (!session) {
       throw RequestError.invalidParams({
@@ -632,7 +734,9 @@ export class AutohandAcpAgent implements Agent {
     return { configOptions: session.configOptions };
   }
 
-  async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
+  async unstable_forkSession(
+    params: ForkSessionRequest,
+  ): Promise<ForkSessionResponse> {
     const parentSession = this.sessions.get(params.sessionId);
     if (!parentSession) {
       throw RequestError.invalidParams({
@@ -681,6 +785,13 @@ export class AutohandAcpAgent implements Agent {
       feedbackTriggerAt: generateFeedbackTrigger(),
       clientName: this.clientInfo?.name,
       clientVersion: this.clientInfo?.version,
+      // Copy auto-mode state from parent
+      autoModeEnabled: parentSession.autoModeEnabled,
+      autoModeMaxIterations: parentSession.autoModeMaxIterations,
+      autoModeMaxRuntime: parentSession.autoModeMaxRuntime,
+      autoModeMaxCost: parentSession.autoModeMaxCost,
+      // Copy additional directories from parent
+      additionalDirs: [...parentSession.additionalDirs],
     });
 
     const forkedSession = this.sessions.get(newSessionId)!;
@@ -711,10 +822,17 @@ export class AutohandAcpAgent implements Agent {
     return response;
   }
 
-  async unstable_resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
+  async unstable_resumeSession(
+    params: ResumeSessionRequest,
+  ): Promise<ResumeSessionResponse> {
     const sessionIdToResume = params.sessionId;
     const autohandHome = resolveAutohandHome();
-    const conversationPath = path.join(autohandHome, "sessions", sessionIdToResume, "conversation.jsonl");
+    const conversationPath = path.join(
+      autohandHome,
+      "sessions",
+      sessionIdToResume,
+      "conversation.jsonl",
+    );
 
     // Check if session exists
     const sessions = await readSessionIndex(autohandHome);
@@ -729,9 +847,11 @@ export class AutohandAcpAgent implements Agent {
     const availableModes = parseAvailableModes();
     const modeId = resolveDefaultMode(availableModes);
     const availableModels = await parseAvailableModelsAsync();
-    const modelId = resolveDefaultModel(availableModels);
-    const configOptions = buildConfigOptions();
-    const useClientTerminal = isTruthy(process.env.AUTOHAND_USE_CLIENT_TERMINAL);
+    const modelId = await resolveDefaultModelAsync(availableModels);
+    const configOptions = await buildConfigOptionsAsync();
+    const useClientTerminal = isTruthy(
+      process.env.AUTOHAND_USE_CLIENT_TERMINAL,
+    );
 
     const mcpServers = parseMcpServers(params.mcpServers);
 
@@ -772,18 +892,39 @@ export class AutohandAcpAgent implements Agent {
       feedbackTriggerAt: generateFeedbackTrigger(),
       clientName: this.clientInfo?.name,
       clientVersion: this.clientInfo?.version,
+      // Auto-mode state (default values for resumed sessions)
+      autoModeEnabled: isTruthy(process.env.AUTOHAND_AUTO_MODE),
+      autoModeMaxIterations: parseInt(
+        process.env.AUTOHAND_AUTO_MODE_MAX_ITERATIONS ?? "50",
+        10,
+      ),
+      autoModeMaxRuntime: parseInt(
+        process.env.AUTOHAND_AUTO_MODE_MAX_RUNTIME ?? "120",
+        10,
+      ),
+      autoModeMaxCost: parseInt(
+        process.env.AUTOHAND_AUTO_MODE_MAX_COST ?? "10",
+        10,
+      ),
+      // Multi-directory support (empty for resumed sessions)
+      additionalDirs: [],
     });
-
 
     // Note: session_info_update is not a valid ACP notification type in Zed
     // The title is set on the session object but we can't notify Zed about it
 
     const response: ResumeSessionResponse = {};
     if (availableModes.length > 0) {
-      response.modes = { availableModes, currentModeId: modeId } as SessionModeState;
+      response.modes = {
+        availableModes,
+        currentModeId: modeId,
+      } as SessionModeState;
     }
     if (availableModels.length > 0) {
-      response.models = { availableModels, currentModelId: modelId } as SessionModelState;
+      response.models = {
+        availableModels,
+        currentModelId: modelId,
+      } as SessionModelState;
     }
     if (configOptions.length > 0) {
       response.configOptions = configOptions;
@@ -792,7 +933,15 @@ export class AutohandAcpAgent implements Agent {
     return response;
   }
 
-  private async applyConfigOption(session: SessionState, configId: string, value: string): Promise<void> {
+  private async applyConfigOption(
+    session: SessionState,
+    configId: string,
+    value: string,
+  ): Promise<void> {
+    // Persist to config file
+    const persistValue = value === "enabled" ? true : value === "disabled" ? false : value;
+    void saveExtensionSetting(configId, persistValue);
+
     switch (configId) {
       case "thinking_level":
         process.env.AUTOHAND_THINKING_LEVEL = value;
@@ -809,6 +958,49 @@ export class AutohandAcpAgent implements Agent {
           process.env.AUTOHAND_INCLUDE_HISTORY = "1";
         } else {
           delete process.env.AUTOHAND_INCLUDE_HISTORY;
+        }
+        break;
+      case "auto_mode":
+        session.autoModeEnabled = value === "enabled";
+        if (session.autoModeEnabled) {
+          // Auto-mode automatically switches to Unrestricted mode
+          const previousMode = session.modeId;
+          session.modeId = "unrestricted";
+          process.env.AUTOHAND_AUTO_MODE = "1";
+          // Notify client of mode change
+          void this.queueSessionUpdate(session, {
+            sessionUpdate: "current_mode_update" as const,
+            currentModeId: "unrestricted",
+          });
+          void this.queueTextUpdate(
+            session,
+            `Auto-mode enabled. Switched from ${previousMode} to unrestricted mode.\n`,
+          );
+        } else {
+          delete process.env.AUTOHAND_AUTO_MODE;
+          void this.queueTextUpdate(session, "Auto-mode disabled.\n");
+        }
+        break;
+      case "auto_mode_max_iterations":
+        session.autoModeMaxIterations = parseInt(value, 10);
+        process.env.AUTOHAND_AUTO_MODE_MAX_ITERATIONS = value;
+        break;
+      case "auto_mode_max_runtime":
+        session.autoModeMaxRuntime = parseInt(value, 10);
+        process.env.AUTOHAND_AUTO_MODE_MAX_RUNTIME = value;
+        break;
+      case "auto_mode_max_cost":
+        session.autoModeMaxCost = parseInt(value, 10);
+        process.env.AUTOHAND_AUTO_MODE_MAX_COST = value;
+        break;
+      case "temperature":
+        process.env.AUTOHAND_TEMPERATURE = value;
+        break;
+      case "stream_output":
+        if (value === "disabled") {
+          process.env.AUTOHAND_NO_STREAM = "1";
+        } else {
+          delete process.env.AUTOHAND_NO_STREAM;
         }
         break;
       default:
@@ -828,22 +1020,33 @@ export class AutohandAcpAgent implements Agent {
 
     // Queue this prompt to run after any pending prompts complete
     const previousPrompt = session.promptQueue;
-    const thisPrompt = previousPrompt.then(() => this.executePrompt(session, params));
-    session.promptQueue = thisPrompt.catch(() => ({ stopReason: "end_turn" as const }));
+    const thisPrompt = previousPrompt.then(() =>
+      this.executePrompt(session, params),
+    );
+    session.promptQueue = thisPrompt.catch(() => ({
+      stopReason: "end_turn" as const,
+    }));
 
     const result = await thisPrompt;
     return result;
   }
 
-  private async executePrompt(session: SessionState, params: PromptRequest): Promise<PromptResponse> {
+  private async executePrompt(
+    session: SessionState,
+    params: PromptRequest,
+  ): Promise<PromptResponse> {
     if (!existsSync(session.cwd)) {
-      await this.queueTextUpdate(session, `\n> **Error:** Workspace not found\n> \`${session.cwd}\`\n`);
+      await this.queueTextUpdate(
+        session,
+        `\n> **Error:** Workspace not found\n> \`${session.cwd}\`\n`,
+      );
       return { stopReason: "end_turn" };
     }
 
     // Check authentication
-    const isStub = process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
-    const isAuthenticated = isStub || await checkAuthStatus();
+    const isStub =
+      process.env.AUTOHAND_CMD && existsSync(process.env.AUTOHAND_CMD);
+    const isAuthenticated = isStub || (await checkAuthStatus());
 
     if (!isAuthenticated) {
       // Throw authRequired error to trigger Zed's auth flow
@@ -852,7 +1055,10 @@ export class AutohandAcpAgent implements Agent {
       });
     }
 
-    const resolvedPrompt = await this.resolvePromptBlocks(session, params.prompt);
+    const resolvedPrompt = await this.resolvePromptBlocks(
+      session,
+      params.prompt,
+    );
     const userText = normalizePromptText(promptToText(resolvedPrompt));
 
     // Generate dynamic session title from first user message
@@ -881,7 +1087,9 @@ export class AutohandAcpAgent implements Agent {
     if (hasImages) {
       // Note: Currently images are described as metadata in the instruction text.
       // Future enhancement: Pass image data directly to Autohand CLI when supported.
-      console.error(`[ACP] Prompt includes ${resolvedPrompt.filter((b) => b.type === "image").length} image(s)`);
+      console.error(
+        `[ACP] Prompt includes ${resolvedPrompt.filter((b) => b.type === "image").length} image(s)`,
+      );
     }
 
     session.history.push({ role: "user", content: userText });
@@ -896,7 +1104,9 @@ export class AutohandAcpAgent implements Agent {
     }
 
     // Start permission server if mode is external
-    const permissionMode = (process.env.AUTOHAND_PERMISSION_MODE ?? DEFAULT_PERMISSION_MODE).toLowerCase();
+    const permissionMode = (
+      process.env.AUTOHAND_PERMISSION_MODE ?? DEFAULT_PERMISSION_MODE
+    ).toLowerCase();
     let permissionCallbackUrl: string | undefined;
     if (permissionMode === "external") {
       try {
@@ -918,6 +1128,13 @@ export class AutohandAcpAgent implements Agent {
       modeId: session.modeId,
       autohandHome: session.autohandHome,
       permissionCallbackUrl,
+      // Auto-mode options
+      autoModeEnabled: session.autoModeEnabled,
+      autoModeMaxIterations: session.autoModeMaxIterations,
+      autoModeMaxRuntime: session.autoModeMaxRuntime,
+      autoModeMaxCost: session.autoModeMaxCost,
+      // Multi-directory support
+      additionalDirs: session.additionalDirs,
     });
 
     // Add client identification to environment for session logging
@@ -936,7 +1153,11 @@ export class AutohandAcpAgent implements Agent {
     }
 
     const tailAbort = new AbortController();
-    const tailPromise = this.trackConversation(session, sessionsSnapshot, tailAbort.signal);
+    const tailPromise = this.trackConversation(
+      session,
+      sessionsSnapshot,
+      tailAbort.signal,
+    );
 
     if (session.useClientTerminal && this.clientCapabilities?.terminal) {
       const toolCallId = randomUUID();
@@ -1038,9 +1259,13 @@ export class AutohandAcpAgent implements Agent {
       // This avoids issues with stats line being split across chunks
       session.rawStdoutForStats += text;
 
+      // Filter out hook events from stdout (they are CLI internal markers)
+      if (text.match(/\[hook:[^\]]+\]/)) {
+        return;
+      }
+
       // Filter out CLI status messages and internal output
       if (
-        text.match(/\[hook:[^\]]+\]/) ||
         text.match(/Turn complete:/i) ||
         text.match(/^Thinking:/i) ||
         text.match(/^→/i) ||
@@ -1050,8 +1275,21 @@ export class AutohandAcpAgent implements Agent {
         return;
       }
 
-      text = text.replace(/<\/?thinking>/gi, "").replace(/<\/?reasoning>/gi, "");
+      text = text
+        .replace(/<\/?thinking>/gi, "")
+        .replace(/<\/?reasoning>/gi, "");
       if (!text.trim()) {
+        return;
+      }
+
+      // Skip structured JSON output (let conversation.jsonl handle these)
+      const trimmedText = text.trim();
+      if (
+        (trimmedText.startsWith("{") && trimmedText.includes('"thought"')) ||
+        (trimmedText.startsWith("{") &&
+          trimmedText.includes('"finalResponse"')) ||
+        (trimmedText.startsWith("{") && trimmedText.includes('"toolCalls"'))
+      ) {
         return;
       }
 
@@ -1083,7 +1321,11 @@ export class AutohandAcpAgent implements Agent {
       error?: Error;
     }>((resolve) => {
       let resolved = false;
-      const finish = (code: number | null, signal: NodeJS.Signals | null, error?: Error) => {
+      const finish = (
+        code: number | null,
+        signal: NodeJS.Signals | null,
+        error?: Error,
+      ) => {
         if (!resolved) {
           resolved = true;
           resolve({ code, signal, error });
@@ -1111,13 +1353,11 @@ export class AutohandAcpAgent implements Agent {
     session.activeProcess = undefined;
     tailAbort.abort();
 
-
     // Wait for tail with timeout to prevent hanging
     await Promise.race([
       tailPromise,
       sleep(2000), // 2 second timeout
     ]);
-
 
     if (session.cancelled) {
       await Promise.race([session.updateQueue.catch(() => {}), sleep(1000)]);
@@ -1125,10 +1365,19 @@ export class AutohandAcpAgent implements Agent {
     }
 
     if (exitResult.error) {
-      await this.queueTextUpdate(
-        session,
-        `\n> **Error:** Failed to launch Autohand\n> ${exitResult.error.message}\n`,
-      );
+      const isNotFound =
+        (exitResult.error as NodeJS.ErrnoException).code === "ENOENT";
+      if (isNotFound) {
+        await this.queueTextUpdate(
+          session,
+          `\n> **Error:** Autohand CLI not found\n>\n> Please install Autohand CLI first:\n> \`\`\`\n> npm install -g @autohand-cli\n> \`\`\`\n>\n> Or visit: https://autohand.ai/cli/\n`,
+        );
+      } else {
+        await this.queueTextUpdate(
+          session,
+          `\n> **Error:** Failed to launch Autohand\n> ${exitResult.error.message}\n`,
+        );
+      }
     }
 
     if (exitResult.code !== 0 && exitResult.code !== null) {
@@ -1155,7 +1404,7 @@ export class AutohandAcpAgent implements Agent {
 
     // Extract completion stats from buffered stdout (avoids chunking issues)
     const statsMatch = session.rawStdoutForStats.match(
-      /Completed in ([^·\n]+)·?\s*([^·\n]*tokens[^\n]*)?/i
+      /Completed in ([^·\n]+)·?\s*([^·\n]*tokens[^\n]*)?/i,
     );
     if (statsMatch) {
       const time = statsMatch[1]?.trim() || "";
@@ -1262,7 +1511,10 @@ export class AutohandAcpAgent implements Agent {
    * Extension method handler for custom ACP requests.
    * Allows clients to send arbitrary requests that are not part of the ACP spec.
    */
-  async extMethod(method: string, _params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async extMethod(
+    method: string,
+    _params: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     // Handle custom extension methods here
     // Currently no custom methods are implemented
     throw RequestError.methodNotFound(method);
@@ -1272,13 +1524,18 @@ export class AutohandAcpAgent implements Agent {
    * Extension notification handler for custom ACP notifications.
    * Allows clients to send arbitrary notifications that are not part of the ACP spec.
    */
-  async extNotification(_method: string, _params: Record<string, unknown>): Promise<void> {
+  async extNotification(
+    _method: string,
+    _params: Record<string, unknown>,
+  ): Promise<void> {
     // Handle custom extension notifications here
     // Currently no custom notifications are implemented
     // Notifications don't return errors, just silently ignore unknown ones
   }
 
-  async unstable_listSessions(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+  async unstable_listSessions(
+    params: ListSessionsRequest,
+  ): Promise<ListSessionsResponse> {
     const autohandHome = resolveAutohandHome();
     const allSessions = await readSessionIndex(autohandHome);
 
@@ -1286,7 +1543,9 @@ export class AutohandAcpAgent implements Agent {
     let filteredSessions = allSessions;
     if (params.cwd) {
       const resolvedCwd = path.resolve(params.cwd);
-      filteredSessions = allSessions.filter((s) => s.projectPath === resolvedCwd);
+      filteredSessions = allSessions.filter(
+        (s) => s.projectPath === resolvedCwd,
+      );
     }
 
     // Sort by createdAt descending (most recent first)
@@ -1308,16 +1567,23 @@ export class AutohandAcpAgent implements Agent {
 
     // Read the conversation.jsonl from the session to get history
     const autohandHome = resolveAutohandHome();
-    const conversationPath = path.join(autohandHome, "sessions", loadSessionId, "conversation.jsonl");
+    const conversationPath = path.join(
+      autohandHome,
+      "sessions",
+      loadSessionId,
+      "conversation.jsonl",
+    );
 
     // Create a new internal session for tracking
     const availableModes = DEFAULT_MODES;
     const modeId = "default";
     const availableModels = await parseAvailableModelsAsync();
-    const modelId = resolveDefaultModel(availableModels);
+    const modelId = await resolveDefaultModelAsync(availableModels);
     const availableCommands = parseAvailableCommands();
-    const configOptions = buildConfigOptions();
-    const useClientTerminal = isTruthy(process.env.AUTOHAND_USE_CLIENT_TERMINAL);
+    const configOptions = await buildConfigOptionsAsync();
+    const useClientTerminal = isTruthy(
+      process.env.AUTOHAND_USE_CLIENT_TERMINAL,
+    );
 
     const mcpServers = parseMcpServers(params.mcpServers);
 
@@ -1357,6 +1623,22 @@ export class AutohandAcpAgent implements Agent {
       feedbackTriggerAt: generateFeedbackTrigger(),
       clientName: this.clientInfo?.name,
       clientVersion: this.clientInfo?.version,
+      // Auto-mode state (default values for loaded sessions)
+      autoModeEnabled: isTruthy(process.env.AUTOHAND_AUTO_MODE),
+      autoModeMaxIterations: parseInt(
+        process.env.AUTOHAND_AUTO_MODE_MAX_ITERATIONS ?? "50",
+        10,
+      ),
+      autoModeMaxRuntime: parseInt(
+        process.env.AUTOHAND_AUTO_MODE_MAX_RUNTIME ?? "120",
+        10,
+      ),
+      autoModeMaxCost: parseInt(
+        process.env.AUTOHAND_AUTO_MODE_MAX_COST ?? "10",
+        10,
+      ),
+      // Multi-directory support (empty for loaded sessions)
+      additionalDirs: [],
     });
 
     const session = this.sessions.get(loadSessionId)!;
@@ -1388,7 +1670,10 @@ export class AutohandAcpAgent implements Agent {
                 sessionUpdate: "agent_message_chunk",
                 content: { type: "text", text: responseText },
               });
-              session.history.push({ role: "assistant", content: responseText });
+              session.history.push({
+                role: "assistant",
+                content: responseText,
+              });
             }
           }
         } catch {
@@ -1396,7 +1681,10 @@ export class AutohandAcpAgent implements Agent {
         }
       }
 
-      await this.queueTextUpdate(session, `\n--- Resumed session ${loadSessionId.slice(0, 8)} ---\n\n`);
+      await this.queueTextUpdate(
+        session,
+        `\n--- Resumed session ${loadSessionId.slice(0, 8)} ---\n\n`,
+      );
     } catch {
       await this.queueTextUpdate(session, `Session ${loadSessionId} loaded.\n`);
     }
@@ -1439,7 +1727,10 @@ export class AutohandAcpAgent implements Agent {
       session.conversationOffset = 0;
       session.conversationRemainder = "";
 
-      await this.queueTextUpdate(session, "Started a new conversation. History cleared.\n");
+      await this.queueTextUpdate(
+        session,
+        "Started a new conversation. History cleared.\n",
+      );
       return { handled: true };
     }
 
@@ -1452,9 +1743,14 @@ export class AutohandAcpAgent implements Agent {
         );
         if (validModel) {
           session.modelId = validModel.modelId;
-          await this.queueTextUpdate(session, `Model changed to: ${validModel.modelId}\n`);
+          await this.queueTextUpdate(
+            session,
+            `Model changed to: ${validModel.modelId}\n`,
+          );
         } else {
-          const available = session.availableModels.map((m) => m.modelId).join(", ");
+          const available = session.availableModels
+            .map((m) => m.modelId)
+            .join(", ");
           await this.queueTextUpdate(
             session,
             `Unknown model: ${newModel}\nAvailable models: ${available || "(none configured)"}\n`,
@@ -1465,12 +1761,18 @@ export class AutohandAcpAgent implements Agent {
         const selectedModel = await this.showModelPicker(session);
         if (selectedModel) {
           session.modelId = selectedModel;
-          await this.queueTextUpdate(session, `Model changed to: ${selectedModel}\n`);
+          await this.queueTextUpdate(
+            session,
+            `Model changed to: ${selectedModel}\n`,
+          );
         } else {
           await this.queueTextUpdate(session, "Model selection cancelled.\n");
         }
       } else {
-        await this.queueTextUpdate(session, `Current model: ${session.modelId || "(default)"}\nNo models configured. Set AUTOHAND_AVAILABLE_MODELS to enable model selection.\n`);
+        await this.queueTextUpdate(
+          session,
+          `Current model: ${session.modelId || "(default)"}\nNo models configured. Set AUTOHAND_AVAILABLE_MODELS to enable model selection.\n`,
+        );
       }
       return { handled: true };
     }
@@ -1480,11 +1782,15 @@ export class AutohandAcpAgent implements Agent {
       if (args.length > 0) {
         const newMode = args.join(" ");
         const validMode = session.availableModes.find(
-          (m) => m.id === newMode || m.name.toLowerCase() === newMode.toLowerCase(),
+          (m) =>
+            m.id === newMode || m.name.toLowerCase() === newMode.toLowerCase(),
         );
         if (validMode) {
           session.modeId = validMode.id;
-          await this.queueTextUpdate(session, `Mode changed to: ${validMode.name}\n`);
+          await this.queueTextUpdate(
+            session,
+            `Mode changed to: ${validMode.name}\n`,
+          );
         } else {
           const available = session.availableModes.map((m) => m.id).join(", ");
           await this.queueTextUpdate(
@@ -1497,13 +1803,18 @@ export class AutohandAcpAgent implements Agent {
         const selectedMode = await this.showModePicker(session);
         if (selectedMode) {
           session.modeId = selectedMode;
-          const modeName = session.availableModes.find((m) => m.id === selectedMode)?.name ?? selectedMode;
+          const modeName =
+            session.availableModes.find((m) => m.id === selectedMode)?.name ??
+            selectedMode;
           await this.queueTextUpdate(session, `Mode changed to: ${modeName}\n`);
         } else {
           await this.queueTextUpdate(session, "Mode selection cancelled.\n");
         }
       } else {
-        await this.queueTextUpdate(session, `Current mode: ${session.modeId}\n`);
+        await this.queueTextUpdate(
+          session,
+          `Current mode: ${session.modeId}\n`,
+        );
       }
       return { handled: true };
     }
@@ -1547,11 +1858,16 @@ export class AutohandAcpAgent implements Agent {
         sessionIdToResume = sessions[num - 1].id;
       } else {
         // Try to match by partial or full session ID
-        const match = sessions.find((s) => s.id === arg || s.id.startsWith(arg));
+        const match = sessions.find(
+          (s) => s.id === arg || s.id.startsWith(arg),
+        );
         if (match) {
           sessionIdToResume = match.id;
         } else {
-          await this.queueTextUpdate(session, `\n> **Error:** Session not found: \`${arg}\`\n`);
+          await this.queueTextUpdate(
+            session,
+            `\n> **Error:** Session not found: \`${arg}\`\n`,
+          );
           return { handled: true };
         }
       }
@@ -1567,8 +1883,13 @@ export class AutohandAcpAgent implements Agent {
       } else {
         const lines = sessions
           .slice(0, 10)
-          .map((s) => `  ${s.id.slice(0, 8)}  ${s.createdAt}  ${s.projectPath}`);
-        await this.queueTextUpdate(session, `Recent sessions:\n${lines.join("\n")}\n`);
+          .map(
+            (s) => `  ${s.id.slice(0, 8)}  ${s.createdAt}  ${s.projectPath}`,
+          );
+        await this.queueTextUpdate(
+          session,
+          `Recent sessions:\n${lines.join("\n")}\n`,
+        );
       }
       return { handled: true };
     }
@@ -1589,7 +1910,9 @@ export class AutohandAcpAgent implements Agent {
 
     // Handle /status - show Autohand status
     if (command === "status") {
-      const configPath = process.env.AUTOHAND_CONFIG ?? path.join(os.homedir(), ".autohand", "config.json");
+      const configPath =
+        process.env.AUTOHAND_CONFIG ??
+        path.join(os.homedir(), ".autohand", "config.json");
       const hasConfig = existsSync(configPath);
       const autohandCmd = process.env.AUTOHAND_CMD ?? "autohand";
 
@@ -1628,14 +1951,20 @@ export class AutohandAcpAgent implements Agent {
         });
 
         // Wait for terminal to complete in background
-        terminal.waitForExit().then(async (result) => {
-          await terminal.release();
-          if (result.exitCode === 0) {
-            this.queueTextUpdate(session, "✅ Thank you for your feedback!\n");
-          }
-        }).catch(() => {
-          // Ignore errors - user may have closed terminal
-        });
+        terminal
+          .waitForExit()
+          .then(async (result) => {
+            await terminal.release();
+            if (result.exitCode === 0) {
+              this.queueTextUpdate(
+                session,
+                "✅ Thank you for your feedback!\n",
+              );
+            }
+          })
+          .catch(() => {
+            // Ignore errors - user may have closed terminal
+          });
 
         return { handled: true };
       } catch {
@@ -1645,6 +1974,235 @@ export class AutohandAcpAgent implements Agent {
         );
         return { handled: true };
       }
+    }
+
+    // Handle /automode - toggle or control auto-mode
+    if (command === "automode") {
+      const subcommand = args[0]?.toLowerCase();
+
+      if (
+        subcommand === "start" ||
+        subcommand === "on" ||
+        subcommand === "enable"
+      ) {
+        if (session.autoModeEnabled) {
+          await this.queueTextUpdate(
+            session,
+            "Auto-mode is already enabled.\n",
+          );
+        } else {
+          await this.applyConfigOption(session, "auto_mode", "enabled");
+        }
+        return { handled: true };
+      }
+
+      if (
+        subcommand === "stop" ||
+        subcommand === "off" ||
+        subcommand === "disable"
+      ) {
+        if (!session.autoModeEnabled) {
+          await this.queueTextUpdate(session, "Auto-mode is not enabled.\n");
+        } else {
+          await this.applyConfigOption(session, "auto_mode", "disabled");
+        }
+        return { handled: true };
+      }
+
+      if (subcommand === "status" || !subcommand) {
+        const status = session.autoModeEnabled ? "enabled" : "disabled";
+        const statusLines = [
+          `Auto-mode: ${status}`,
+          `Max iterations: ${session.autoModeMaxIterations}`,
+          `Max runtime: ${session.autoModeMaxRuntime} minutes`,
+          `Max cost: $${session.autoModeMaxCost}`,
+          `Current mode: ${session.modeId}`,
+        ];
+        await this.queueTextUpdate(session, statusLines.join("\n") + "\n");
+        return { handled: true };
+      }
+
+      await this.queueTextUpdate(
+        session,
+        "Usage: /automode [start|stop|status]\n",
+      );
+      return { handled: true };
+    }
+
+    // Handle /add-dir - add additional working directory
+    if (command === "add-dir" || command === "adddir") {
+      if (args.length === 0) {
+        if (session.additionalDirs.length === 0) {
+          await this.queueTextUpdate(
+            session,
+            "No additional directories added.\nUsage: /add-dir <path>\n",
+          );
+        } else {
+          const dirList = session.additionalDirs
+            .map((d, i) => `  ${i + 1}. ${d}`)
+            .join("\n");
+          await this.queueTextUpdate(
+            session,
+            `Additional directories:\n${dirList}\n`,
+          );
+        }
+        return { handled: true };
+      }
+
+      const dirPath = args.join(" "); // Handle paths with spaces
+      const absolutePath = path.isAbsolute(dirPath)
+        ? dirPath
+        : path.resolve(session.cwd, dirPath);
+
+      if (!existsSync(absolutePath)) {
+        await this.queueTextUpdate(
+          session,
+          `Directory not found: ${absolutePath}\n`,
+        );
+        return { handled: true };
+      }
+
+      if (session.additionalDirs.includes(absolutePath)) {
+        await this.queueTextUpdate(
+          session,
+          `Directory already added: ${absolutePath}\n`,
+        );
+        return { handled: true };
+      }
+
+      session.additionalDirs.push(absolutePath);
+      await this.queueTextUpdate(session, `Added directory: ${absolutePath}\n`);
+      return { handled: true };
+    }
+
+    // Handle /remove-dir - remove additional working directory
+    if (command === "remove-dir" || command === "removedir") {
+      if (args.length === 0) {
+        await this.queueTextUpdate(
+          session,
+          "Usage: /remove-dir <path or number>\n",
+        );
+        return { handled: true };
+      }
+
+      const arg = args.join(" ");
+      const num = parseInt(arg, 10);
+
+      if (!isNaN(num) && num >= 1 && num <= session.additionalDirs.length) {
+        const removed = session.additionalDirs.splice(num - 1, 1)[0];
+        await this.queueTextUpdate(session, `Removed directory: ${removed}\n`);
+        return { handled: true };
+      }
+
+      const absolutePath = path.isAbsolute(arg)
+        ? arg
+        : path.resolve(session.cwd, arg);
+      const index = session.additionalDirs.indexOf(absolutePath);
+      if (index >= 0) {
+        session.additionalDirs.splice(index, 1);
+        await this.queueTextUpdate(
+          session,
+          `Removed directory: ${absolutePath}\n`,
+        );
+      } else {
+        await this.queueTextUpdate(
+          session,
+          `Directory not found in list: ${absolutePath}\n`,
+        );
+      }
+      return { handled: true };
+    }
+
+    // Handle /skills - manage skills
+    if (command === "skills") {
+      const subcommand = args[0]?.toLowerCase();
+
+      if (!subcommand || subcommand === "list") {
+        // List installed skills - pass to CLI
+        return { handled: false };
+      }
+
+      if (subcommand === "install") {
+        const skillName = args.slice(1).join(" ");
+        if (!skillName) {
+          await this.queueTextUpdate(
+            session,
+            "Usage: /skills install <skill-name>\n",
+          );
+          return { handled: true };
+        }
+        // Pass to CLI to handle installation
+        return { handled: false };
+      }
+
+      if (subcommand === "remove" || subcommand === "uninstall") {
+        const skillName = args.slice(1).join(" ");
+        if (!skillName) {
+          await this.queueTextUpdate(
+            session,
+            "Usage: /skills remove <skill-name>\n",
+          );
+          return { handled: true };
+        }
+        // Pass to CLI to handle removal
+        return { handled: false };
+      }
+
+      await this.queueTextUpdate(
+        session,
+        "Usage: /skills [list|install <name>|remove <name>]\n",
+      );
+      return { handled: true };
+    }
+
+    // Handle /memory - manage conversation memory
+    if (command === "memory") {
+      const subcommand = args[0]?.toLowerCase();
+
+      if (!subcommand || subcommand === "list") {
+        // List memories - pass to CLI
+        return { handled: false };
+      }
+
+      if (subcommand === "save" || subcommand === "add") {
+        const key = args[1];
+        const value = args.slice(2).join(" ");
+        if (!key || !value) {
+          await this.queueTextUpdate(
+            session,
+            "Usage: /memory save <key> <value>\n",
+          );
+          return { handled: true };
+        }
+        // Pass to CLI to handle save
+        return { handled: false };
+      }
+
+      if (subcommand === "recall" || subcommand === "get") {
+        const key = args[1];
+        if (!key) {
+          await this.queueTextUpdate(session, "Usage: /memory recall <key>\n");
+          return { handled: true };
+        }
+        // Pass to CLI to handle recall
+        return { handled: false };
+      }
+
+      if (subcommand === "delete" || subcommand === "remove") {
+        const key = args[1];
+        if (!key) {
+          await this.queueTextUpdate(session, "Usage: /memory delete <key>\n");
+          return { handled: true };
+        }
+        // Pass to CLI to handle delete
+        return { handled: false };
+      }
+
+      await this.queueTextUpdate(
+        session,
+        "Usage: /memory [list|save <key> <value>|recall <key>|delete <key>]\n",
+      );
+      return { handled: true };
     }
 
     // Commands that should be passed to Autohand CLI
@@ -1671,17 +2229,16 @@ export class AutohandAcpAgent implements Agent {
   }
 
   private generateHelpText(session: SessionState): string {
-    const lines = [
-      "Available commands:",
-      "",
-    ];
+    const lines = ["Available commands:", ""];
 
     for (const cmd of session.availableCommands) {
       lines.push(`  /${cmd.name.padEnd(12)} ${cmd.description}`);
     }
 
     lines.push("");
-    lines.push("File mentions: Use @filename to include file content in your prompt");
+    lines.push(
+      "File mentions: Use @filename to include file content in your prompt",
+    );
     lines.push("");
 
     return lines.join("\n") + "\n";
@@ -1692,9 +2249,18 @@ export class AutohandAcpAgent implements Agent {
     sessionIdToResume: string,
   ): Promise<{ handled: boolean }> {
     const autohandCmd = process.env.AUTOHAND_CMD ?? "autohand";
-    const configPath = process.env.AUTOHAND_CONFIG ?? path.join(os.homedir(), ".autohand", "config.json");
+    const configPath =
+      process.env.AUTOHAND_CONFIG ??
+      path.join(os.homedir(), ".autohand", "config.json");
 
-    const args = ["resume", sessionIdToResume, "--config", configPath, "--path", session.cwd];
+    const args = [
+      "resume",
+      sessionIdToResume,
+      "--config",
+      configPath,
+      "--path",
+      session.cwd,
+    ];
 
     if (session.modelId) {
       args.push("--model", session.modelId);
@@ -1752,7 +2318,11 @@ export class AutohandAcpAgent implements Agent {
       return null;
     }
 
-    const options: Array<{ optionId: string; name: string; kind: "allow_once" | "reject_once" }> = session.availableModels.map((m) => ({
+    const options: Array<{
+      optionId: string;
+      name: string;
+      kind: "allow_once" | "reject_once";
+    }> = session.availableModels.map((m) => ({
       optionId: m.modelId,
       name: m.name || m.modelId,
       kind: "allow_once" as const,
@@ -1798,7 +2368,11 @@ export class AutohandAcpAgent implements Agent {
       return null;
     }
 
-    const options: Array<{ optionId: string; name: string; kind: "allow_once" | "reject_once" }> = session.availableModes.map((m) => ({
+    const options: Array<{
+      optionId: string;
+      name: string;
+      kind: "allow_once" | "reject_once";
+    }> = session.availableModes.map((m) => ({
       optionId: m.id,
       name: `${m.name}${m.description ? ` - ${m.description}` : ""}`,
       kind: "allow_once" as const,
@@ -1855,7 +2429,6 @@ export class AutohandAcpAgent implements Agent {
       return;
     }
 
-
     // Disable stdout fallback immediately when we find conversation.jsonl
     // This prevents duplicate messages from stdout racing with conversation.jsonl
     session.hasStructuredOutput = true;
@@ -1897,10 +2470,18 @@ export class AutohandAcpAgent implements Agent {
         return;
       }
 
-      const bytesToRead = Math.min(stats.size - session.conversationOffset, CHUNK_SIZE);
+      const bytesToRead = Math.min(
+        stats.size - session.conversationOffset,
+        CHUNK_SIZE,
+      );
       const buffer = Buffer.alloc(bytesToRead);
 
-      const { bytesRead } = await fileHandle.read(buffer, 0, bytesToRead, session.conversationOffset);
+      const { bytesRead } = await fileHandle.read(
+        buffer,
+        0,
+        bytesToRead,
+        session.conversationOffset,
+      );
 
       if (bytesRead === 0) {
         return;
@@ -1935,9 +2516,14 @@ export class AutohandAcpAgent implements Agent {
     }
   }
 
-  private async handleSessionMessage(session: SessionState, message: SessionMessage): Promise<void> {
+  private async handleSessionMessage(
+    session: SessionState,
+    message: SessionMessage,
+  ): Promise<void> {
     if (message.role === "assistant") {
-      const parsed = message.content ? parseAssistantContent(message.content) : null;
+      const parsed = message.content
+        ? parseAssistantContent(message.content)
+        : null;
       const toolCalls = Array.isArray(message.toolCalls)
         ? message.toolCalls
         : parsed?.toolCalls;
@@ -1965,13 +2551,22 @@ export class AutohandAcpAgent implements Agent {
         session.stdoutBuffer = "";
       };
 
-      const usesThoughtAsResponse = shouldUseThoughtAsResponse(parsed, toolCalls);
-      if (!usesThoughtAsResponse && parsed?.thought && hasText(parsed.thought)) {
+      const usesThoughtAsResponse = shouldUseThoughtAsResponse(
+        parsed,
+        toolCalls,
+      );
+      if (
+        !usesThoughtAsResponse &&
+        parsed?.thought &&
+        hasText(parsed.thought)
+      ) {
         markStructuredOutput();
         await this.queueThoughtUpdate(session, parsed.thought);
       }
 
-      const responseText = parsed ? resolveAssistantResponse(parsed, toolCalls) : null;
+      const responseText = parsed
+        ? resolveAssistantResponse(parsed, toolCalls)
+        : null;
       if (responseText) {
         markStructuredOutput();
         markAgentResponse();
@@ -1997,7 +2592,10 @@ export class AutohandAcpAgent implements Agent {
     }
   }
 
-  private async handleToolCallStart(session: SessionState, call: ToolCallRecord): Promise<void> {
+  private async handleToolCallStart(
+    session: SessionState,
+    call: ToolCallRecord,
+  ): Promise<void> {
     const tool = call.tool ?? "tool";
     const toolCallId = call.id ?? randomUUID();
     const kind = TOOL_KIND_MAP[tool] ?? "other";
@@ -2131,7 +2729,10 @@ export class AutohandAcpAgent implements Agent {
     });
   }
 
-  private async handleToolCallResult(session: SessionState, message: SessionMessage): Promise<void> {
+  private async handleToolCallResult(
+    session: SessionState,
+    message: SessionMessage,
+  ): Promise<void> {
     const toolCallId = message.tool_call_id ?? randomUUID();
     const outputText = message.content ?? "";
     const failed = /error|failed|exception/i.test(outputText);
@@ -2153,11 +2754,12 @@ export class AutohandAcpAgent implements Agent {
       });
     }
 
-    const contentText = usesTerminal && isStreaming
-      ? undefined
-      : isStreaming
-        ? bufferedOutput ?? outputText
-        : outputText;
+    const contentText =
+      usesTerminal && isStreaming
+        ? undefined
+        : isStreaming
+          ? (bufferedOutput ?? outputText)
+          : outputText;
 
     const update: ToolCallUpdate = {
       toolCallId,
@@ -2292,7 +2894,10 @@ export class AutohandAcpAgent implements Agent {
     return session.updateQueue;
   }
 
-  private queueThoughtUpdate(session: SessionState, thought: string): Promise<void> {
+  private queueThoughtUpdate(
+    session: SessionState,
+    thought: string,
+  ): Promise<void> {
     const chunks = chunkText(thought, MAX_UPDATE_CHUNK);
 
     session.updateQueue = session.updateQueue
@@ -2317,9 +2922,69 @@ export class AutohandAcpAgent implements Agent {
   }
 
   /**
+   * Forward hook events to the client via agent_thought_chunk with metadata.
+   * Hook events include: session-start, session-end, pre-tool, post-tool,
+   * file-modified, automode:start, automode:iteration, automode:checkpoint, automode:complete
+   */
+  private forwardHookEvent(
+    session: SessionState,
+    hookEvent: string,
+    rawOutput: string,
+  ): Promise<void> {
+    // Parse the hook event and any associated data
+    const [eventType, ...dataParts] = hookEvent.split(":");
+    const eventData = dataParts.join(":").trim();
+
+    // Build metadata for the hook event
+    const hookMeta: Record<string, unknown> = {
+      hook: true,
+      event: eventType,
+      timestamp: new Date().toISOString(),
+    };
+
+    // Parse event-specific data
+    if (eventType === "pre-tool" || eventType === "post-tool") {
+      // Format: [hook:pre-tool:tool_name]
+      hookMeta.tool = eventData;
+    } else if (eventType === "file-modified") {
+      // Format: [hook:file-modified:filepath]
+      hookMeta.file = eventData;
+    } else if (eventType === "automode") {
+      // Format: [hook:automode:action:data]
+      const [action, ...actionData] = eventData.split(":");
+      hookMeta.action = action;
+      if (actionData.length > 0) {
+        hookMeta.data = actionData.join(":");
+      }
+    }
+
+    session.updateQueue = session.updateQueue
+      .catch(() => undefined)
+      .then(async () => {
+        const notification: SessionNotification = {
+          sessionId: session.id,
+          update: {
+            sessionUpdate: "agent_thought_chunk",
+            content: {
+              type: "text",
+              text: `[Hook: ${hookEvent}]`,
+            },
+            _meta: hookMeta,
+          },
+        };
+        await this.client.sessionUpdate(notification);
+      });
+
+    return session.updateQueue;
+  }
+
+  /**
    * Delegate file read to client if supported, otherwise read directly.
    */
-  private async delegatedReadFile(session: SessionState, filePath: string): Promise<string | null> {
+  private async delegatedReadFile(
+    session: SessionState,
+    filePath: string,
+  ): Promise<string | null> {
     // Try client-delegated read first
     if (this.clientCapabilities?.fs?.readTextFile) {
       try {
@@ -2344,7 +3009,11 @@ export class AutohandAcpAgent implements Agent {
   /**
    * Delegate file write to client if supported, otherwise write directly.
    */
-  private async delegatedWriteFile(session: SessionState, filePath: string, content: string): Promise<boolean> {
+  private async delegatedWriteFile(
+    session: SessionState,
+    filePath: string,
+    content: string,
+  ): Promise<boolean> {
     // Try client-delegated write first
     if (this.clientCapabilities?.fs?.writeTextFile) {
       try {
@@ -2410,7 +3079,9 @@ function parseAssistantContent(raw: string): ParsedAssistantContent {
           : typeof record.response === "string"
             ? record.response
             : undefined,
-      toolCalls: Array.isArray(record.toolCalls) ? (record.toolCalls as ToolCallRecord[]) : undefined,
+      toolCalls: Array.isArray(record.toolCalls)
+        ? (record.toolCalls as ToolCallRecord[])
+        : undefined,
     };
   } catch {
     return { raw, response: raw, structured: false };
@@ -2466,7 +3137,9 @@ function promptToText(prompt: ContentBlock[]): string {
       case "resource": {
         const resource = block.resource;
         if ("text" in resource) {
-          const header = resource.uri ? `[resource: ${resource.uri}]` : "[resource]";
+          const header = resource.uri
+            ? `[resource: ${resource.uri}]`
+            : "[resource]";
           parts.push(`${header}\n${resource.text}`.trim());
         } else {
           const uri = "uri" in resource ? resource.uri : "unknown";
@@ -2522,12 +3195,19 @@ function buildInstruction(session: SessionState, userText: string): string {
     process.env.AUTOHAND_MAX_HISTORY_CHARS ?? String(DEFAULT_MAX_HISTORY_CHARS),
     10,
   );
-  const historyLimit = Number.isNaN(historyLimitRaw) ? DEFAULT_HISTORY_LIMIT : historyLimitRaw;
-  const maxChars = Number.isNaN(maxCharsRaw) ? DEFAULT_MAX_HISTORY_CHARS : maxCharsRaw;
+  const historyLimit = Number.isNaN(historyLimitRaw)
+    ? DEFAULT_HISTORY_LIMIT
+    : historyLimitRaw;
+  const maxChars = Number.isNaN(maxCharsRaw)
+    ? DEFAULT_MAX_HISTORY_CHARS
+    : maxCharsRaw;
 
   const history = session.history.slice(-Math.max(0, historyLimit));
   const historyText = history
-    .map((entry) => `${entry.role === "user" ? "User" : "Assistant"}: ${entry.content}`)
+    .map(
+      (entry) =>
+        `${entry.role === "user" ? "User" : "Assistant"}: ${entry.content}`,
+    )
     .join("\n\n");
 
   const combined = `Conversation context:\n${historyText}\n\nCurrent request:\n${requestText}`;
@@ -2541,6 +3221,13 @@ function buildAutohandCommand(options: {
   modeId: string;
   autohandHome: string;
   permissionCallbackUrl?: string;
+  // Auto-mode options
+  autoModeEnabled?: boolean;
+  autoModeMaxIterations?: number;
+  autoModeMaxRuntime?: number;
+  autoModeMaxCost?: number;
+  // Multi-directory support
+  additionalDirs?: string[];
 }): {
   command: string;
   args: string[];
@@ -2551,9 +3238,17 @@ function buildAutohandCommand(options: {
   const commandParts = rawCommand ? parseEnvArgs(rawCommand) : [];
   const command = commandParts[0] || rawCommand || "autohand";
   const commandArgs = commandParts.slice(1);
-  const args: string[] = [...commandArgs, "--prompt", options.instruction, "--path", options.cwd];
+  const args: string[] = [
+    ...commandArgs,
+    "--prompt",
+    options.instruction,
+    "--path",
+    options.cwd,
+  ];
 
-  const configPath = process.env.AUTOHAND_CONFIG ?? path.join(os.homedir(), ".autohand", "config.json");
+  const configPath =
+    process.env.AUTOHAND_CONFIG ??
+    path.join(os.homedir(), ".autohand", "config.json");
   args.push("--config", configPath);
 
   if (options.modelId) {
@@ -2566,14 +3261,21 @@ function buildAutohandCommand(options: {
   }
 
   // Use session mode to determine permission flags
-  // Mode IDs: interactive, full-access, restricted, dry-run
+  // Mode IDs: interactive, full-access, unrestricted, auto-mode, restricted, dry-run
   const modeId = options.modeId;
+
+  // Check if auto-mode is selected via mode dropdown (not just config option)
+  const isAutoModeViaMode = modeId === "auto-mode";
 
   if (modeId === "dry-run") {
     args.push("--dry-run");
   } else if (modeId === "full-access") {
     // Full access: auto-approve everything
     args.push("--yes");
+  } else if (modeId === "unrestricted" || isAutoModeViaMode) {
+    // Unrestricted: skip all approval prompts
+    // Auto-mode also runs in unrestricted mode
+    args.push("--unrestricted");
   } else if (modeId === "restricted") {
     args.push("--restricted");
   } else if (modeId === "interactive") {
@@ -2584,6 +3286,35 @@ function buildAutohandCommand(options: {
 
   if (isTruthy(process.env.AUTOHAND_AUTO_COMMIT)) {
     args.push("--auto-commit");
+  }
+
+  // Auto-mode flags
+  // Note: --auto-mode takes the instruction as its argument (not --prompt)
+  // Auto-mode can be triggered via config option (autoModeEnabled) or mode selection (auto-mode)
+  if (options.autoModeEnabled || isAutoModeViaMode) {
+    // Find and remove --prompt from args since --auto-mode takes the instruction
+    const promptIndex = args.indexOf("--prompt");
+    if (promptIndex !== -1) {
+      const instruction = args[promptIndex + 1];
+      args.splice(promptIndex, 2); // Remove --prompt and its value
+      args.push("--auto-mode", instruction);
+    }
+    if (options.autoModeMaxIterations) {
+      args.push("--max-iterations", String(options.autoModeMaxIterations));
+    }
+    if (options.autoModeMaxRuntime) {
+      args.push("--max-runtime", String(options.autoModeMaxRuntime));
+    }
+    if (options.autoModeMaxCost) {
+      args.push("--max-cost", String(options.autoModeMaxCost));
+    }
+  }
+
+  // Multi-directory support
+  if (options.additionalDirs && options.additionalDirs.length > 0) {
+    for (const dir of options.additionalDirs) {
+      args.push("--add-dir", dir);
+    }
   }
 
   args.push(...parseEnvArgs(process.env.AUTOHAND_EXTRA_ARGS));
@@ -2650,16 +3381,44 @@ function resolveDefaultMode(modes: SessionMode[]): string {
 // Default models as fallback
 const DEFAULT_MODELS: ModelInfo[] = [
   // Anthropic
-  { modelId: "claude-sonnet-4-20250514", name: "Claude Sonnet 4", description: "Anthropic - Fast and intelligent" },
-  { modelId: "claude-opus-4-20250514", name: "Claude Opus 4", description: "Anthropic - Most capable" },
+  {
+    modelId: "claude-sonnet-4-20250514",
+    name: "Claude Sonnet 4",
+    description: "Anthropic - Fast and intelligent",
+  },
+  {
+    modelId: "claude-opus-4-20250514",
+    name: "Claude Opus 4",
+    description: "Anthropic - Most capable",
+  },
   // OpenAI
-  { modelId: "gpt-4o", name: "GPT-4o", description: "OpenAI - Multimodal flagship" },
-  { modelId: "gpt-4o-mini", name: "GPT-4o Mini", description: "OpenAI - Fast and affordable" },
+  {
+    modelId: "gpt-4o",
+    name: "GPT-4o",
+    description: "OpenAI - Multimodal flagship",
+  },
+  {
+    modelId: "gpt-4o-mini",
+    name: "GPT-4o Mini",
+    description: "OpenAI - Fast and affordable",
+  },
   { modelId: "o1", name: "o1", description: "OpenAI - Advanced reasoning" },
-  { modelId: "o1-mini", name: "o1 Mini", description: "OpenAI - Fast reasoning" },
+  {
+    modelId: "o1-mini",
+    name: "o1 Mini",
+    description: "OpenAI - Fast reasoning",
+  },
   // Google
-  { modelId: "gemini-2.0-flash", name: "Gemini 2.0 Flash", description: "Google - Fast multimodal" },
-  { modelId: "gemini-2.5-pro", name: "Gemini 2.5 Pro", description: "Google - Most capable" },
+  {
+    modelId: "gemini-2.0-flash",
+    name: "Gemini 2.0 Flash",
+    description: "Google - Fast multimodal",
+  },
+  {
+    modelId: "gemini-2.5-pro",
+    name: "Gemini 2.5 Pro",
+    description: "Google - Most capable",
+  },
 ];
 
 /**
@@ -2680,12 +3439,13 @@ async function readModelsFromConfig(): Promise<ModelInfo[]> {
       seenModelIds.add(modelId);
 
       // Create display name from model ID
-      const name = modelId
-        .split("/").pop() // Remove provider prefix like "anthropic/"
-        ?.split(":")[0] // Remove version suffix like ":free"
-        ?.replace(/-/g, " ") // Replace dashes with spaces
-        ?.replace(/\b\w/g, (c: string) => c.toUpperCase()) // Title case
-        ?? modelId;
+      const name =
+        modelId
+          .split("/")
+          .pop() // Remove provider prefix like "anthropic/"
+          ?.split(":")[0] // Remove version suffix like ":free"
+          ?.replace(/-/g, " ") // Replace dashes with spaces
+          ?.replace(/\b\w/g, (c: string) => c.toUpperCase()) ?? modelId; // Title case
 
       models.push({
         modelId,
@@ -2697,7 +3457,10 @@ async function readModelsFromConfig(): Promise<ModelInfo[]> {
     // Add top-level model first (if configured)
     if (config.model) {
       const provider = config.provider ?? "default";
-      addModel(config.model, provider.charAt(0).toUpperCase() + provider.slice(1));
+      addModel(
+        config.model,
+        provider.charAt(0).toUpperCase() + provider.slice(1),
+      );
     }
 
     // Add models from each provider section
@@ -2705,7 +3468,10 @@ async function readModelsFromConfig(): Promise<ModelInfo[]> {
     for (const provider of providers) {
       const providerConfig = config[provider];
       if (providerConfig?.model) {
-        addModel(providerConfig.model, provider.charAt(0).toUpperCase() + provider.slice(1));
+        addModel(
+          providerConfig.model,
+          provider.charAt(0).toUpperCase() + provider.slice(1),
+        );
       }
     }
 
@@ -2786,6 +3552,44 @@ function resolveDefaultModel(models: ModelInfo[]): string {
   return models[0]?.modelId ?? "";
 }
 
+/**
+ * Async version that reads default model from config file
+ */
+async function resolveDefaultModelAsync(models: ModelInfo[]): Promise<string> {
+  // Check env first
+  const envModel = process.env.AUTOHAND_MODEL;
+  if (envModel && models.some((model) => model.modelId === envModel)) {
+    return envModel;
+  }
+
+  // Read from config file to get the active provider's model
+  const configPath = path.join(resolveAutohandHome(), "config.json");
+  try {
+    const configContent = await fs.readFile(configPath, "utf-8");
+    const config = JSON.parse(configContent);
+
+    // Get the active provider
+    const provider = config.provider;
+    if (provider && config[provider]?.model) {
+      const providerModel = config[provider].model;
+      // Check if this model is in our list
+      if (models.some((m) => m.modelId === providerModel)) {
+        return providerModel;
+      }
+    }
+
+    // Fall back to top-level model
+    if (config.model && models.some((m) => m.modelId === config.model)) {
+      return config.model;
+    }
+  } catch {
+    // Ignore errors reading config
+  }
+
+  // Fall back to first model in list
+  return models[0]?.modelId ?? "";
+}
+
 function parseAvailableCommands(): AvailableCommand[] {
   const rawJson = process.env.AUTOHAND_AVAILABLE_COMMANDS_JSON;
   if (rawJson) {
@@ -2802,10 +3606,20 @@ function parseAvailableCommands(): AvailableCommand[] {
   return DEFAULT_COMMANDS;
 }
 
-type McpServerInfo = { name: string; type: string; url?: string; command?: string };
+type McpServerInfo = {
+  name: string;
+  type: string;
+  url?: string;
+  command?: string;
+};
 
 function parseMcpServers(
-  servers?: Array<{ type?: string; name: string; url?: string; command?: string }>,
+  servers?: Array<{
+    type?: string;
+    name: string;
+    url?: string;
+    command?: string;
+  }>,
 ): McpServerInfo[] {
   if (!servers) return [];
 
@@ -2834,16 +3648,67 @@ function resolveAutohandHome(): string {
 type AutohandCommand = { command: string; baseArgs: string[] };
 
 function findAutohandBinary(): AutohandCommand {
-  // Use AUTOHAND_CMD if set
+  // Use AUTOHAND_CMD if set (for testing/development)
   if (process.env.AUTOHAND_CMD) {
     return { command: process.env.AUTOHAND_CMD, baseArgs: [] };
   }
-  // Check if local dev CLI exists (has login command)
-  const localCli = "/Users/igorcosta/Documents/autohand/cli-3/dist/index.js";
-  if (existsSync(localCli)) {
-    return { command: "node", baseArgs: [localCli] };
-  }
+  // Use globally installed autohand command
   return { command: "autohand", baseArgs: [] };
+}
+
+/**
+ * Check if the Autohand CLI is installed and accessible
+ */
+async function checkCliInstalled(): Promise<{
+  installed: boolean;
+  version?: string;
+  error?: string;
+}> {
+  const { command } = findAutohandBinary();
+
+  return new Promise((resolve) => {
+    const child = spawn(command, ["--version"], {
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 5000,
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout?.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr?.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    child.on("error", (err) => {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        resolve({
+          installed: false,
+          error: `Autohand CLI not found. Please install it first:\n\n  npm install -g @anthropics/autohand\n\nOr visit: https://autohand.ai/docs/install`,
+        });
+      } else {
+        resolve({
+          installed: false,
+          error: `Failed to check Autohand CLI: ${err.message}`,
+        });
+      }
+    });
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        const version = stdout.trim().match(/\d+\.\d+\.\d+/)?.[0];
+        resolve({ installed: true, version });
+      } else {
+        resolve({
+          installed: false,
+          error: stderr.trim() || `Autohand CLI exited with code ${code}`,
+        });
+      }
+    });
+  });
 }
 
 /**
@@ -2867,7 +3732,10 @@ async function checkAuthStatus(): Promise<boolean> {
 /**
  * Get authenticated user info from config
  */
-async function getUserInfo(): Promise<{ name?: string; email?: string } | null> {
+async function getUserInfo(): Promise<{
+  name?: string;
+  email?: string;
+} | null> {
   const configPath = path.join(resolveAutohandHome(), "config.json");
   try {
     const configContent = await fs.readFile(configPath, "utf-8");
@@ -2905,11 +3773,19 @@ async function waitForConversationPath(
 
     const sessions = await readSessionIndex(autohandHome);
     const candidates = sessions
-      .filter((session) => !snapshot.has(session.id) && path.resolve(session.projectPath) === resolvedCwd)
+      .filter(
+        (session) =>
+          !snapshot.has(session.id) &&
+          path.resolve(session.projectPath) === resolvedCwd,
+      )
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
     if (candidates.length > 0) {
       for (const candidate of candidates) {
-        const result = path.join(sessionsDir, candidate.id, "conversation.jsonl");
+        const result = path.join(
+          sessionsDir,
+          candidate.id,
+          "conversation.jsonl",
+        );
         if (existsSync(result)) {
           return result;
         }
@@ -2918,23 +3794,41 @@ async function waitForConversationPath(
 
     if (existsSync(sessionsDir)) {
       const entries = await fs.readdir(sessionsDir, { withFileTypes: true });
-      const dirCandidates: Array<{ createdAt: string; conversationPath: string }> = [];
+      const dirCandidates: Array<{
+        createdAt: string;
+        conversationPath: string;
+      }> = [];
       for (const entry of entries) {
         if (!entry.isDirectory() || snapshot.has(entry.name)) {
           continue;
         }
-        const metadataPath = path.join(sessionsDir, entry.name, "metadata.json");
-        let metadata: { projectPath?: string; createdAt?: string } | null = null;
+        const metadataPath = path.join(
+          sessionsDir,
+          entry.name,
+          "metadata.json",
+        );
+        let metadata: { projectPath?: string; createdAt?: string } | null =
+          null;
         try {
           const raw = await fs.readFile(metadataPath, "utf8");
-          metadata = JSON.parse(raw) as { projectPath?: string; createdAt?: string };
+          metadata = JSON.parse(raw) as {
+            projectPath?: string;
+            createdAt?: string;
+          };
         } catch {
           continue;
         }
-        if (!metadata?.projectPath || path.resolve(metadata.projectPath) !== resolvedCwd) {
+        if (
+          !metadata?.projectPath ||
+          path.resolve(metadata.projectPath) !== resolvedCwd
+        ) {
           continue;
         }
-        const conversationPath = path.join(sessionsDir, entry.name, "conversation.jsonl");
+        const conversationPath = path.join(
+          sessionsDir,
+          entry.name,
+          "conversation.jsonl",
+        );
         if (!existsSync(conversationPath)) {
           continue;
         }
@@ -2944,7 +3838,9 @@ async function waitForConversationPath(
         });
       }
       if (dirCandidates.length > 0) {
-        const latest = dirCandidates.sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+        const latest = dirCandidates.sort((a, b) =>
+          b.createdAt.localeCompare(a.createdAt),
+        )[0];
         return latest.conversationPath;
       }
     }
@@ -2955,11 +3851,15 @@ async function waitForConversationPath(
   return null;
 }
 
-async function readSessionIndex(autohandHome: string): Promise<Array<{ id: string; projectPath: string; createdAt: string }>> {
+async function readSessionIndex(
+  autohandHome: string,
+): Promise<Array<{ id: string; projectPath: string; createdAt: string }>> {
   const indexPath = path.join(autohandHome, "sessions", "index.json");
   try {
     const content = await fs.readFile(indexPath, "utf8");
-    const parsed = JSON.parse(content) as { sessions?: Array<{ id: string; projectPath: string; createdAt: string }> };
+    const parsed = JSON.parse(content) as {
+      sessions?: Array<{ id: string; projectPath: string; createdAt: string }>;
+    };
     return parsed.sessions ?? [];
   } catch {
     return [];
@@ -3007,12 +3907,23 @@ function planFromTodo(args?: unknown): Plan | null {
   if (!args || typeof args !== "object") {
     return null;
   }
-  const tasks = (args as { tasks?: Array<{ id: string; title: string; status: string; description?: string }> }).tasks;
+  const tasks = (
+    args as {
+      tasks?: Array<{
+        id: string;
+        title: string;
+        status: string;
+        description?: string;
+      }>;
+    }
+  ).tasks;
   if (!Array.isArray(tasks)) {
     return null;
   }
   const entries: PlanEntry[] = tasks.map((task) => ({
-    content: task.description ? `${task.title} — ${task.description}` : task.title,
+    content: task.description
+      ? `${task.title} — ${task.description}`
+      : task.title,
     status: normalizePlanStatus(task.status),
     priority: "medium",
   }));
@@ -3027,15 +3938,19 @@ function planFromNotes(args?: unknown): Plan | null {
   if (!notes) {
     return null;
   }
-  const entries: PlanEntry[] = [{
-    content: notes,
-    status: "in_progress",
-    priority: "low",
-  }];
+  const entries: PlanEntry[] = [
+    {
+      content: notes,
+      status: "in_progress",
+      priority: "low",
+    },
+  ];
   return { entries };
 }
 
-function normalizePlanStatus(status?: string): "pending" | "in_progress" | "completed" {
+function normalizePlanStatus(
+  status?: string,
+): "pending" | "in_progress" | "completed" {
   if (status === "completed") return "completed";
   if (status === "in_progress") return "in_progress";
   return "pending";
@@ -3062,7 +3977,11 @@ function isTruthy(value: string | undefined): boolean {
   if (!value) {
     return false;
   }
-  return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+  return (
+    value === "1" ||
+    value.toLowerCase() === "true" ||
+    value.toLowerCase() === "yes"
+  );
 }
 
 function titleCase(value: string): string {
@@ -3116,12 +4035,64 @@ function generateSessionTitle(userText: string): string {
 }
 
 /**
- * Build session config options for UI dropdowns.
+ * Read extension settings from config file
  */
-function buildConfigOptions(): SessionConfigOption[] {
-  const autoCommit = isTruthy(process.env.AUTOHAND_AUTO_COMMIT);
-  const includeHistory = isTruthy(process.env.AUTOHAND_INCLUDE_HISTORY);
-  const thinkingLevel = process.env.AUTOHAND_THINKING_LEVEL ?? "normal";
+async function readExtensionSettings(): Promise<Record<string, unknown>> {
+  const configPath = path.join(resolveAutohandHome(), "config.json");
+  try {
+    const content = await fs.readFile(configPath, "utf-8");
+    const config = JSON.parse(content);
+    return config.extension ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Save extension setting to config file
+ */
+async function saveExtensionSetting(key: string, value: unknown): Promise<void> {
+  const configPath = path.join(resolveAutohandHome(), "config.json");
+  try {
+    let config: Record<string, unknown> = {};
+    try {
+      const content = await fs.readFile(configPath, "utf-8");
+      config = JSON.parse(content);
+    } catch {
+      // Config doesn't exist, start fresh
+    }
+
+    // Ensure extension section exists
+    if (!config.extension || typeof config.extension !== "object") {
+      config.extension = {};
+    }
+
+    // Update the setting
+    (config.extension as Record<string, unknown>)[key] = value;
+
+    // Write back
+    await fs.writeFile(configPath, JSON.stringify(config, null, 2), "utf-8");
+  } catch (error) {
+    console.error(`Failed to save setting ${key}:`, error);
+  }
+}
+
+/**
+ * Build session config options with values from config file (async version)
+ */
+async function buildConfigOptionsAsync(): Promise<SessionConfigOption[]> {
+  const settings = await readExtensionSettings();
+
+  // Read from config with env var fallback
+  const thinkingLevel = (settings.thinking_level as string) ?? process.env.AUTOHAND_THINKING_LEVEL ?? "normal";
+  const autoCommit = settings.auto_commit === true || isTruthy(process.env.AUTOHAND_AUTO_COMMIT);
+  const includeHistory = settings.include_history === true || isTruthy(process.env.AUTOHAND_INCLUDE_HISTORY);
+  const autoModeEnabled = settings.auto_mode === true || isTruthy(process.env.AUTOHAND_AUTO_MODE);
+  const autoModeMaxIterations = String(settings.auto_mode_max_iterations ?? process.env.AUTOHAND_AUTO_MODE_MAX_ITERATIONS ?? "50");
+  const autoModeMaxRuntime = String(settings.auto_mode_max_runtime ?? process.env.AUTOHAND_AUTO_MODE_MAX_RUNTIME ?? "120");
+  const autoModeMaxCost = String(settings.auto_mode_max_cost ?? process.env.AUTOHAND_AUTO_MODE_MAX_COST ?? "10");
+  const temperature = String(settings.temperature ?? process.env.AUTOHAND_TEMPERATURE ?? "0.7");
+  const streamOutput = settings.stream_output !== false; // default true
 
   return [
     {
@@ -3131,9 +4102,17 @@ function buildConfigOptions(): SessionConfigOption[] {
       description: "Reasoning depth for complex tasks",
       currentValue: thinkingLevel,
       options: [
-        { value: "none", name: "None", description: "Direct responses, no reasoning" },
+        {
+          value: "none",
+          name: "None",
+          description: "Direct responses, no reasoning",
+        },
         { value: "normal", name: "Normal", description: "Standard reasoning" },
-        { value: "extended", name: "Extended", description: "Deep reasoning for complex tasks" },
+        {
+          value: "extended",
+          name: "Extended",
+          description: "Deep reasoning for complex tasks",
+        },
       ],
     },
     {
@@ -3143,8 +4122,16 @@ function buildConfigOptions(): SessionConfigOption[] {
       description: "Automatically commit changes",
       currentValue: autoCommit ? "enabled" : "disabled",
       options: [
-        { value: "disabled", name: "Disabled", description: "Manual commits only" },
-        { value: "enabled", name: "Enabled", description: "Auto-commit after changes" },
+        {
+          value: "disabled",
+          name: "Disabled",
+          description: "Manual commits only",
+        },
+        {
+          value: "enabled",
+          name: "Enabled",
+          description: "Auto-commit after changes",
+        },
       ],
     },
     {
@@ -3154,8 +4141,167 @@ function buildConfigOptions(): SessionConfigOption[] {
       description: "Include conversation history in prompts",
       currentValue: includeHistory ? "enabled" : "disabled",
       options: [
-        { value: "disabled", name: "Disabled", description: "Start fresh each prompt" },
-        { value: "enabled", name: "Enabled", description: "Carry context forward" },
+        {
+          value: "disabled",
+          name: "Disabled",
+          description: "Start fresh each prompt",
+        },
+        {
+          value: "enabled",
+          name: "Enabled",
+          description: "Carry context forward",
+        },
+      ],
+    },
+    {
+      type: "select",
+      id: "auto_mode",
+      name: "Auto-Mode",
+      description:
+        "Autonomous development loop (switches to Unrestricted mode)",
+      currentValue: autoModeEnabled ? "enabled" : "disabled",
+      options: [
+        {
+          value: "disabled",
+          name: "Disabled",
+          description: "Interactive mode",
+        },
+        {
+          value: "enabled",
+          name: "Enabled",
+          description: "Autonomous agent loop",
+        },
+      ],
+    },
+    {
+      type: "select",
+      id: "auto_mode_max_iterations",
+      name: "Max Iterations",
+      description: "Maximum iterations for auto-mode",
+      currentValue: autoModeMaxIterations,
+      options: [
+        { value: "25", name: "25", description: "Light tasks" },
+        { value: "50", name: "50", description: "Standard tasks (default)" },
+        { value: "100", name: "100", description: "Complex tasks" },
+        { value: "200", name: "200", description: "Extended tasks" },
+      ],
+    },
+    {
+      type: "select",
+      id: "auto_mode_max_runtime",
+      name: "Max Runtime",
+      description: "Maximum runtime in minutes for auto-mode",
+      currentValue: autoModeMaxRuntime,
+      options: [
+        { value: "30", name: "30 min", description: "Quick tasks" },
+        { value: "60", name: "1 hour", description: "Standard tasks" },
+        {
+          value: "120",
+          name: "2 hours",
+          description: "Extended tasks (default)",
+        },
+        { value: "240", name: "4 hours", description: "Long-running tasks" },
+      ],
+    },
+    {
+      type: "select",
+      id: "auto_mode_max_cost",
+      name: "Max Cost",
+      description: "Maximum cost in dollars for auto-mode",
+      currentValue: autoModeMaxCost,
+      options: [
+        { value: "5", name: "$5", description: "Budget limit" },
+        { value: "10", name: "$10", description: "Standard limit (default)" },
+        { value: "25", name: "$25", description: "Extended limit" },
+        { value: "50", name: "$50", description: "High limit" },
+      ],
+    },
+    {
+      type: "select",
+      id: "temperature",
+      name: "Temperature",
+      description: "Controls randomness in responses (lower = more focused)",
+      currentValue: temperature,
+      options: [
+        { value: "0", name: "0.0", description: "Deterministic, most focused" },
+        { value: "0.3", name: "0.3", description: "Low creativity" },
+        { value: "0.7", name: "0.7", description: "Balanced (default)" },
+        { value: "1.0", name: "1.0", description: "High creativity" },
+      ],
+    },
+    {
+      type: "select",
+      id: "stream_output",
+      name: "Stream Output",
+      description: "Stream responses in real-time",
+      currentValue: streamOutput ? "enabled" : "disabled",
+      options: [
+        { value: "enabled", name: "Enabled", description: "Show responses as they generate" },
+        { value: "disabled", name: "Disabled", description: "Wait for complete response" },
+      ],
+    },
+  ];
+}
+
+/**
+ * Build session config options for UI dropdowns (sync version for fallback).
+ */
+function buildConfigOptions(): SessionConfigOption[] {
+  const thinkingLevel = process.env.AUTOHAND_THINKING_LEVEL ?? "normal";
+  const autoCommit = isTruthy(process.env.AUTOHAND_AUTO_COMMIT);
+  const includeHistory = isTruthy(process.env.AUTOHAND_INCLUDE_HISTORY);
+  const autoModeEnabled = isTruthy(process.env.AUTOHAND_AUTO_MODE);
+  const autoModeMaxIterations = process.env.AUTOHAND_AUTO_MODE_MAX_ITERATIONS ?? "50";
+  const autoModeMaxRuntime = process.env.AUTOHAND_AUTO_MODE_MAX_RUNTIME ?? "120";
+  const autoModeMaxCost = process.env.AUTOHAND_AUTO_MODE_MAX_COST ?? "10";
+  const temperature = process.env.AUTOHAND_TEMPERATURE ?? "0.7";
+  const streamOutput = !isTruthy(process.env.AUTOHAND_NO_STREAM);
+
+  return [
+    {
+      type: "select",
+      id: "thinking_level",
+      name: "Thinking",
+      description: "Reasoning depth for complex tasks",
+      currentValue: thinkingLevel,
+      options: [
+        { value: "none", name: "None", description: "Direct responses" },
+        { value: "normal", name: "Normal", description: "Standard reasoning" },
+        { value: "extended", name: "Extended", description: "Deep reasoning" },
+      ],
+    },
+    {
+      type: "select",
+      id: "auto_commit",
+      name: "Auto-commit",
+      description: "Automatically commit changes",
+      currentValue: autoCommit ? "enabled" : "disabled",
+      options: [
+        { value: "disabled", name: "Disabled", description: "Manual commits" },
+        { value: "enabled", name: "Enabled", description: "Auto-commit" },
+      ],
+    },
+    {
+      type: "select",
+      id: "auto_mode",
+      name: "Auto-Mode",
+      description: "Autonomous development loop",
+      currentValue: autoModeEnabled ? "enabled" : "disabled",
+      options: [
+        { value: "disabled", name: "Disabled", description: "Interactive" },
+        { value: "enabled", name: "Enabled", description: "Autonomous" },
+      ],
+    },
+    {
+      type: "select",
+      id: "temperature",
+      name: "Temperature",
+      description: "Response randomness",
+      currentValue: temperature,
+      options: [
+        { value: "0", name: "0.0", description: "Deterministic" },
+        { value: "0.7", name: "0.7", description: "Balanced" },
+        { value: "1.0", name: "1.0", description: "Creative" },
       ],
     },
   ];
