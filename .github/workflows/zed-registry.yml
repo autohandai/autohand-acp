@@ -130,46 +130,33 @@ jobs:
           FORK_OWNER=$(gh api user --jq '.login')
           echo "Fork owner: $FORK_OWNER"
 
-          # Clone the fork with submodules
-          gh repo clone "$FORK_OWNER/extensions" zed-extensions -- --recurse-submodules
+          # Clone the fork (shallow, no submodules - they take forever)
+          gh repo clone "$FORK_OWNER/extensions" zed-extensions -- --depth=1
           cd zed-extensions
 
           # Set up remotes with auth
           git remote set-url origin "https://${GH_TOKEN}@github.com/$FORK_OWNER/extensions.git"
           git remote add upstream https://github.com/zed-industries/extensions.git 2>/dev/null || true
-          git fetch upstream
+          git fetch upstream --depth=1
           git checkout main
           git reset --hard upstream/main
-
-          # Initialize submodules after reset
-          git submodule update --init --recursive
 
           # Create a branch for the PR
           BRANCH="add-autohand-acp-v$VERSION"
           git checkout -b "$BRANCH"
 
-          # Check if extension already exists as submodule
-          if [ -d "extensions/autohand-acp" ] && [ -f "extensions/autohand-acp/.git" ]; then
-            echo "Extension submodule already exists, updating to v$VERSION..."
-            cd extensions/autohand-acp
-            git fetch origin --tags
-            git checkout "v$VERSION"
-            cd ../..
-            git add extensions/autohand-acp
-          elif [ -d "extensions/autohand-acp" ]; then
-            echo "Extension directory exists but not as submodule, removing and re-adding..."
-            rm -rf extensions/autohand-acp
-            git submodule add "https://github.com/$REPO.git" extensions/autohand-acp
-            cd extensions/autohand-acp
-            git checkout "v$VERSION"
-            cd ../..
-          else
-            echo "Adding new extension submodule..."
-            git submodule add "https://github.com/$REPO.git" extensions/autohand-acp
-            cd extensions/autohand-acp
-            git checkout "v$VERSION"
-            cd ../..
+          # Add our extension as submodule (remove first if exists)
+          if [ -d "extensions/autohand-acp" ]; then
+            echo "Extension exists, removing to re-add at correct version..."
+            git rm -rf extensions/autohand-acp 2>/dev/null || rm -rf extensions/autohand-acp
           fi
+
+          echo "Adding extension submodule at v$VERSION..."
+          git submodule add "https://github.com/$REPO.git" extensions/autohand-acp
+          cd extensions/autohand-acp
+          git fetch --tags
+          git checkout "v$VERSION"
+          cd ../..
 
           # Update extensions.toml
           if grep -q "\[autohand-acp\]" extensions.toml; then
