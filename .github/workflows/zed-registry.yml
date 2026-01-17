@@ -211,32 +211,11 @@ jobs:
           # Push to fork
           git push -u origin "$BRANCH" --force
 
-          # Create PR body file
-          cat > /tmp/pr_body.md << 'PREOF'
-## Extension: Autohand CLI
-
-AI coding agent powered by Autohand CLI via Agent Client Protocol (ACP).
-
-### Features
-- File editing and code modifications
-- Code search across codebase
-- Terminal command execution
-- Session management and history
-- Permission controls (external/auto/restricted)
-- Dynamic session titles
-- Image/screenshot support
-- MCP server integration
-PREOF
-          echo "" >> /tmp/pr_body.md
-          echo "### Links" >> /tmp/pr_body.md
-          echo "- Repository: https://github.com/$REPO" >> /tmp/pr_body.md
-          echo "- Release: https://github.com/$REPO/releases/tag/v$VERSION" >> /tmp/pr_body.md
-
           # Create PR
           PR_URL=$(gh pr create \
             --repo zed-industries/extensions \
             --title "Add autohand-acp extension v$VERSION" \
-            --body-file /tmp/pr_body.md \
+            --body "Autohand CLI extension v$VERSION - AI coding agent via ACP. See https://github.com/$REPO" \
             --head "$FORK_OWNER:$BRANCH" \
             --base main 2>&1) || true
 
