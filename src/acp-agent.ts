@@ -2922,63 +2922,6 @@ export class AutohandAcpAgent implements Agent {
   }
 
   /**
-   * Forward hook events to the client via agent_thought_chunk with metadata.
-   * Hook events include: session-start, session-end, pre-tool, post-tool,
-   * file-modified, automode:start, automode:iteration, automode:checkpoint, automode:complete
-   */
-  private forwardHookEvent(
-    session: SessionState,
-    hookEvent: string,
-    rawOutput: string,
-  ): Promise<void> {
-    // Parse the hook event and any associated data
-    const [eventType, ...dataParts] = hookEvent.split(":");
-    const eventData = dataParts.join(":").trim();
-
-    // Build metadata for the hook event
-    const hookMeta: Record<string, unknown> = {
-      hook: true,
-      event: eventType,
-      timestamp: new Date().toISOString(),
-    };
-
-    // Parse event-specific data
-    if (eventType === "pre-tool" || eventType === "post-tool") {
-      // Format: [hook:pre-tool:tool_name]
-      hookMeta.tool = eventData;
-    } else if (eventType === "file-modified") {
-      // Format: [hook:file-modified:filepath]
-      hookMeta.file = eventData;
-    } else if (eventType === "automode") {
-      // Format: [hook:automode:action:data]
-      const [action, ...actionData] = eventData.split(":");
-      hookMeta.action = action;
-      if (actionData.length > 0) {
-        hookMeta.data = actionData.join(":");
-      }
-    }
-
-    session.updateQueue = session.updateQueue
-      .catch(() => undefined)
-      .then(async () => {
-        const notification: SessionNotification = {
-          sessionId: session.id,
-          update: {
-            sessionUpdate: "agent_thought_chunk",
-            content: {
-              type: "text",
-              text: `[Hook: ${hookEvent}]`,
-            },
-            _meta: hookMeta,
-          },
-        };
-        await this.client.sessionUpdate(notification);
-      });
-
-    return session.updateQueue;
-  }
-
-  /**
    * Delegate file read to client if supported, otherwise read directly.
    */
   private async delegatedReadFile(
@@ -3544,16 +3487,8 @@ async function parseAvailableModelsAsync(): Promise<ModelInfo[]> {
   return DEFAULT_MODELS;
 }
 
-function resolveDefaultModel(models: ModelInfo[]): string {
-  const envModel = process.env.AUTOHAND_MODEL;
-  if (envModel && models.some((model) => model.modelId === envModel)) {
-    return envModel;
-  }
-  return models[0]?.modelId ?? "";
-}
-
 /**
- * Async version that reads default model from config file
+ * Reads default model from config file
  */
 async function resolveDefaultModelAsync(models: ModelInfo[]): Promise<string> {
   // Check env first
@@ -4238,70 +4173,6 @@ async function buildConfigOptionsAsync(): Promise<SessionConfigOption[]> {
       options: [
         { value: "enabled", name: "Enabled", description: "Show responses as they generate" },
         { value: "disabled", name: "Disabled", description: "Wait for complete response" },
-      ],
-    },
-  ];
-}
-
-/**
- * Build session config options for UI dropdowns (sync version for fallback).
- */
-function buildConfigOptions(): SessionConfigOption[] {
-  const thinkingLevel = process.env.AUTOHAND_THINKING_LEVEL ?? "normal";
-  const autoCommit = isTruthy(process.env.AUTOHAND_AUTO_COMMIT);
-  const includeHistory = isTruthy(process.env.AUTOHAND_INCLUDE_HISTORY);
-  const autoModeEnabled = isTruthy(process.env.AUTOHAND_AUTO_MODE);
-  const autoModeMaxIterations = process.env.AUTOHAND_AUTO_MODE_MAX_ITERATIONS ?? "50";
-  const autoModeMaxRuntime = process.env.AUTOHAND_AUTO_MODE_MAX_RUNTIME ?? "120";
-  const autoModeMaxCost = process.env.AUTOHAND_AUTO_MODE_MAX_COST ?? "10";
-  const temperature = process.env.AUTOHAND_TEMPERATURE ?? "0.7";
-  const streamOutput = !isTruthy(process.env.AUTOHAND_NO_STREAM);
-
-  return [
-    {
-      type: "select",
-      id: "thinking_level",
-      name: "Thinking",
-      description: "Reasoning depth for complex tasks",
-      currentValue: thinkingLevel,
-      options: [
-        { value: "none", name: "None", description: "Direct responses" },
-        { value: "normal", name: "Normal", description: "Standard reasoning" },
-        { value: "extended", name: "Extended", description: "Deep reasoning" },
-      ],
-    },
-    {
-      type: "select",
-      id: "auto_commit",
-      name: "Auto-commit",
-      description: "Automatically commit changes",
-      currentValue: autoCommit ? "enabled" : "disabled",
-      options: [
-        { value: "disabled", name: "Disabled", description: "Manual commits" },
-        { value: "enabled", name: "Enabled", description: "Auto-commit" },
-      ],
-    },
-    {
-      type: "select",
-      id: "auto_mode",
-      name: "Auto-Mode",
-      description: "Autonomous development loop",
-      currentValue: autoModeEnabled ? "enabled" : "disabled",
-      options: [
-        { value: "disabled", name: "Disabled", description: "Interactive" },
-        { value: "enabled", name: "Enabled", description: "Autonomous" },
-      ],
-    },
-    {
-      type: "select",
-      id: "temperature",
-      name: "Temperature",
-      description: "Response randomness",
-      currentValue: temperature,
-      options: [
-        { value: "0", name: "0.0", description: "Deterministic" },
-        { value: "0.7", name: "0.7", description: "Balanced" },
-        { value: "1.0", name: "1.0", description: "Creative" },
       ],
     },
   ];
